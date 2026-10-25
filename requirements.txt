@@ -1,0 +1,6 @@
+# System requirement that pip cannot install: Tkinter (the GUI toolkit).
+#   Debian / Ubuntu / Linux Mint:  sudo apt install python3-tk
+#   Windows / macOS: included with the installer from python.org
+numpy>=1.24
+Pillow>=10.0
+customtkinter>=5.2
