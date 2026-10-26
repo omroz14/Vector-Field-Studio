@@ -1,3 +1,16 @@
-.venv/
+# Python
 __pycache__/
+*.py[cod]
+.venv/
+venv/
 .env
+
+# Editors and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Exported results
+*.gif
+!docs/**/*.gif
