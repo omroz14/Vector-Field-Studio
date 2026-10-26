@@ -23,6 +23,12 @@ FONT_BIG = (FAMILY, -30, "bold")
 
 PAD = 14   # inner padding of a card
 
+# CustomTkinter bug: the side panels listen to the mouse wheel app-wide, and over widgets Tk builds itself
+# (such as the file dialog) event.widget is a plain string, which crashes the scroll check.
+_valid_scroll = ctk.CTkScrollableFrame._check_if_valid_scroll
+ctk.CTkScrollableFrame._check_if_valid_scroll = (
+    lambda self, widget: not isinstance(widget, str) and _valid_scroll(self, widget))
+
 
 def hex_to_rgb(h):
     h = h.lstrip("#")
