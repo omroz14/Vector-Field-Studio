@@ -16,7 +16,7 @@
 Vector Field Studio draws any field **F(x, y, t) = (Fx, Fy)**. Pick one of twelve classic presets or type your
 own equations, then switch between arrows, streamlines and animated particles. Colour the background by
 speed, divergence or curl, zoom and pan freely, and hover anywhere to read the field's values under the cursor.
-It shares its look with [Pixel Sort Studio](https://github.com/omroz14/pixel-sort-studio).
+It shares its look with [Pixel Sort Studio](https://github.com/omroz14/Pixel-Sort-Studio).
 
 | Arrows | Streamlines | Particles |
 |:---:|:---:|:---:|
@@ -62,7 +62,7 @@ You need **Python 3.10 or newer** (developed and tested with 3.12).
 1. Install Python from [python.org](https://www.python.org/downloads/). In the installer, tick
    **Add python.exe to PATH**. Tkinter is included.
 2. Download this project: **Code → Download ZIP** on GitHub, then unzip it. If you use Git, run
-   `git clone https://github.com/omroz14/vector-field-studio.git` instead.
+   `git clone https://github.com/omroz14/Vector-Field-Studio.git` instead.
 3. Open PowerShell in the project folder and run:
 
    ```powershell
@@ -81,8 +81,8 @@ Tkinter is a system package, so `pip` cannot install it.
 
 ```bash
 sudo apt install python3-tk python3-venv git
-git clone https://github.com/omroz14/vector-field-studio.git
-cd vector-field-studio
+git clone https://github.com/omroz14/Vector-Field-Studio.git
+cd Vector-Field-Studio
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -94,8 +94,8 @@ python main.py
 Install Python from [python.org](https://www.python.org/downloads/) (it includes Tkinter), then:
 
 ```bash
-git clone https://github.com/omroz14/vector-field-studio.git
-cd vector-field-studio
+git clone https://github.com/omroz14/Vector-Field-Studio.git
+cd Vector-Field-Studio
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -200,8 +200,8 @@ For a field F = (Fx, Fy):
 
 ## More projects
 
-- [Pixel Sort Studio](https://github.com/omroz14/pixel-sort-studio): sort the pixels of a photo along any direction.
-- [Pixel Merger Studio](https://github.com/omroz14/pixel-merger-studio): rebuild one image out of the pixels of another.
+- [Pixel Sort Studio](https://github.com/omroz14/Pixel-Sort-Studio): sort the pixels of a photo along any direction.
+- [Pixel Merger Studio](https://github.com/omroz14/Pixel-Merger-Studio): rebuild one image out of the pixels of another.
 
 ## License
 
