@@ -24,9 +24,9 @@ It shares its look with [Pixel Sort Studio](https://github.com/omroz14/Pixel-sor
 
 ## Demo
 
-| Particles | Double gyre | Custom field |
+| Vortex · Ice | Van der Pol · Magma | Double gyre · Fire |
 |:---:|:---:|:---:|
-| ![Particle trails](docs/images/anim-particles.gif) | ![Double gyre over time](docs/images/anim-double-gyre.gif) | ![Custom equations](docs/images/anim-custom.gif) |
+| ![Vortex with the Ice palette](docs/images/vortex_ice.gif) | ![Van der Pol oscillator with the Magma palette](docs/images/van_der_pol_magma.gif) | ![Double gyre with the Fire palette](docs/images/double_gyre_fire.gif) |
 
 ## Contents
 
