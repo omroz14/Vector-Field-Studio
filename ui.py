@@ -25,8 +25,8 @@ BACKGROUNDS = (("none", "None"), ("magnitude", "|F|"), ("divergence", "div F"), 
 BG_NOTES = {
     "none": "Plain background. Vectors are colored by their length.",
     "magnitude": "Brightness shows the speed |F|.",
-    "divergence": "Orange: the field spreads out (source). Violet: it converges (sink).",
-    "curl": "Orange: counter-clockwise rotation. Violet: clockwise.",
+    "divergence": "Where the field spreads out (source) or converges (sink).",
+    "curl": "Which way the field rotates: clockwise or counter-clockwise.",
 }
 BG_SCALE = {   # colorbar labels: left, middle, right
     "none": ("slow", "", "fast"),
@@ -78,6 +78,7 @@ class App(ctk.CTk):
         self.t = 0.0
         self.mode = ARROWS
         self.bg_kind = "none"
+        self.palette = "studio"
         self.colored = tk.BooleanVar(value=True)
         self.arrow_spacing = 36
         self.arrow_len = 100            # % of the arrow cell
@@ -174,11 +175,15 @@ class App(ctk.CTk):
     def _build_right(self, right):
         """How to show it: colors, arrows, streamlines, particles, the probe and export."""
         # COLORS
-        c = card(right, "COLORS", "key B")
+        c = card(right, "COLORS", "keys B, P")
         self.bg_tabs = segmented(c, [lbl for _, lbl in BACKGROUNDS],
                                  lambda v: self.set_background(_key(BACKGROUNDS, v)))
         self.bg_tabs.set(_label(BACKGROUNDS, self.bg_kind))
         self.bg_tabs.pack(fill="x", padx=PAD, pady=(0, 8))
+        ctk.CTkLabel(c, text="Palette", font=FONT, text_color=TEXT, height=20, anchor="w").pack(
+            fill="x", padx=PAD, pady=(0, 2))
+        self.palette_grid = ChoiceGrid(c, render.PALETTE_NAMES, self.palette, self.set_palette, cols=3)
+        ctk.CTkFrame(c, fg_color="transparent", height=8).pack()
         self.colorbar = tk.Canvas(c, height=10, bg=SURFACE, highlightthickness=0)
         self.colorbar.pack(fill="x", padx=PAD)
         self.colorbar.bind("<Configure>", lambda e: self._draw_colorbar())
@@ -243,7 +248,7 @@ class App(ctk.CTk):
 
         self.tabs = segmented(main, MODES, self.set_mode)
         self.tabs.grid(row=0, column=0, sticky="w", pady=(4, 10))
-        ctk.CTkLabel(main, text="Space play · 1–3 views · B background · R reset view · C clear traces",
+        ctk.CTkLabel(main, text="Space play · 1–3 views · B background · P palette · R reset view · C clear traces",
                      font=FONT_SMALL, text_color=MUTED).grid(row=0, column=0, sticky="e", pady=(4, 10))
 
         frame = ctk.CTkFrame(main, fg_color=SURFACE, corner_radius=12)
@@ -284,7 +289,7 @@ class App(ctk.CTk):
 
     def _bind_keys(self):
         keys = {"<space>": self.toggle_play, "<r>": self.reset_view, "<c>": self.clear_pins,
-                "<b>": self._cycle_background, "<t>": self.reset_time}
+                "<b>": self._cycle_background, "<p>": self._cycle_palette, "<t>": self.reset_time}
         for seq, fn in keys.items():
             self.bind(seq, self._unless_typing(fn))
         self.bind("<Control-s>", lambda e: self.save_png())
@@ -336,16 +341,29 @@ class App(ctk.CTk):
         keys = [k for k, _ in BACKGROUNDS]
         self.set_background(keys[(keys.index(self.bg_kind) + 1) % len(keys)])
 
+    def set_palette(self, key):
+        self.palette = key
+        self.palette_grid.select(key)
+        self._draw_colorbar()
+        if self.trail is not None:
+            self.trail[:] = 0             # old trails keep the colors of the previous palette
+        self._invalidate()
+
+    def _cycle_palette(self):
+        keys = [k for k, _ in render.PALETTE_NAMES]
+        self.set_palette(keys[(keys.index(self.palette) + 1) % len(keys)])
+
     def _draw_colorbar(self):
         c = self.colorbar
         c.delete("all")
         w = max(c.winfo_width(), 10)
+        pal = render.PALETTES[self.palette]
         if self.bg_kind == "none":
-            lut = render.LINE
+            lut = pal.line
         elif self.bg_kind == "magnitude":
-            lut = render.SEQ[:render.MAG_TOP + 1]
+            lut = pal.seq[:render.MAG_TOP + 1]
         else:
-            lut = render.DIV
+            lut = pal.div
         for x in range(0, w, 2):
             r, g, b = lut[int(x / w * (len(lut) - 1))]
             c.create_rectangle(x, 0, x + 2, 10, fill=f"#{r:02x}{g:02x}{b:02x}", outline="")
@@ -506,6 +524,7 @@ class App(ctk.CTk):
                 arrows = dict(spacing=self.arrow_spacing, length=self.arrow_len / 100, equal=self.equal_len.get())
             self._static = render.compose(self.field, view, t, vref, self.bg_kind, arrows, lines, traces,
                                           colored=self.colored.get(), heads=self.stream_heads.get(),
+                                          palette=self.palette,
                                           ss=1 if quick else 2)
         except ValueError as exc:
             self._status(f"Could not evaluate the field: {exc}")
@@ -564,7 +583,8 @@ class App(ctk.CTk):
         self._dot(px.astype(int), py.astype(int), self._particle_colors(np.hypot(u, v) / vref))
 
     def _particle_colors(self, rel):
-        return render.vector_colors(rel, self.colored.get() and self.bg_kind == "none").astype(np.float32)
+        return render.vector_colors(rel, self.colored.get() and self.bg_kind == "none",
+                                    self.palette).astype(np.float32)
 
     def _dot(self, px, py, col):
         """Paints 2×2 dots into the trail buffer."""

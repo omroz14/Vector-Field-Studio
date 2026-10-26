@@ -18,20 +18,41 @@ def _ramp(stops, pos):
     return lut
 
 
-# Magnitude: background -> violet -> warm orange -> white (the motion map palette of Pixel Sort Studio).
-SEQ = _ramp([SURFACE, ACCENT, WARM, "#ffffff"], [0.0, 0.4, 0.75, 1.0])
-# Signed quantities: violet below zero, orange above.
-DIV = _ramp(["#d6ccff", ACCENT, SURFACE, WARM, "#ffe2b8"], [0.0, 0.25, 0.5, 0.75, 1.0])
-# Vectors on the plain background: the bright part of SEQ, so slow vectors stay visible.
-LINE = SEQ[np.linspace(90, 255, 256).astype(int)]
-MAG_TOP = 200      # the magnitude heatmap stops short of white so vectors stay readable on it
+class Palette:
+    """A color scheme: `seq` for the magnitude (0 -> fast), `div` for signed quantities (negative -> positive),
+    and `line` for vectors on the plain background: the bright part of `seq`, so slow vectors stay visible."""
+
+    def __init__(self, seq, div, seq_pos=None):
+        self.seq = _ramp(seq, seq_pos or np.linspace(0, 1, len(seq)))
+        self.div = _ramp(div, np.linspace(0, 1, len(div)))
+        self.line = self.seq[np.linspace(90, 255, 256).astype(int)]
 
 
-def vector_colors(rel, colored):
+# Sequential stops run from slow to fast; diverging stops have the stage color in the middle, at zero.
+PALETTES = {
+    "studio": Palette([SURFACE, ACCENT, WARM, "#ffffff"],     # the motion map palette of Pixel Sort Studio
+                      ["#d6ccff", ACCENT, SURFACE, WARM, "#ffe2b8"], [0.0, 0.4, 0.75, 1.0]),
+    "viridis": Palette(["#440154", "#3b528b", "#21918c", "#5ec962", "#fde725"],
+                       ["#b4c8ff", "#3b6fd8", SURFACE, "#d8503b", "#ffc4a8"]),
+    "magma": Palette(["#000004", "#3b0f70", "#8c2981", "#de4968", "#fe9f6d", "#fcfdbf"],
+                     ["#a8f0e0", "#2a9d8f", SURFACE, "#de4968", "#fcc5c0"]),
+    "ice": Palette([SURFACE, "#16425b", "#2a87b0", "#7fd3e6", "#f2fbff"],
+                   ["#7fd3e6", "#2a87b0", SURFACE, "#c98a2e", "#ffe2b8"]),
+    "fire": Palette([SURFACE, "#5c1a1a", "#c0392b", "#f39c12", "#fff3b0"],
+                    ["#7fd3e6", "#2a87b0", SURFACE, "#c0392b", "#f39c12"]),
+    "turbo": Palette(["#30123b", "#4669db", "#26bce1", "#5ffc73", "#d0e935", "#fb8022", "#7a0403"],
+                     ["#26bce1", "#4669db", SURFACE, "#fb8022", "#d0e935"]),
+}
+PALETTE_NAMES = (("studio", "Studio"), ("viridis", "Viridis"), ("magma", "Magma"),
+                 ("ice", "Ice"), ("fire", "Fire"), ("turbo", "Turbo"))
+MAG_TOP = 200      # the magnitude heatmap stops short of the brightest color so vectors stay readable on it
+
+
+def vector_colors(rel, colored, palette="studio"):
     """(N, 3) uint8 colors for relative speeds rel (1 = typical speed)."""
     if not colored:
         return np.tile(np.array(hex_to_rgb(TEXT), np.uint8), (len(rel), 1))
-    return LINE[(np.clip(rel, 0, 1) * 255).astype(int)]
+    return PALETTES[palette].line[(np.clip(rel, 0, 1) * 255).astype(int)]
 
 
 def nice_step(raw):
@@ -49,7 +70,7 @@ def ticks(view, target_px=90):
     return step, xs, ys
 
 
-def heatmap(field, view, t, kind, vref, res=3):
+def heatmap(field, view, t, kind, vref, palette="studio", res=3):
     """Background image: plain, |F|, divergence or curl, computed on a coarse grid and scaled up later."""
     if kind == "none":
         return Image.new("RGB", (view.w, view.h), SURFACE)
@@ -58,7 +79,7 @@ def heatmap(field, view, t, kind, vref, res=3):
     U, V = field(X, Y, t)
     if kind == "magnitude":
         idx = (np.clip(np.hypot(U, V) / vref, 0, 1) * MAG_TOP).astype(np.uint8)
-        return Image.fromarray(SEQ[idx])
+        return Image.fromarray(PALETTES[palette].seq[idx])
     dx, dy = X[0, 1] - X[0, 0], Y[1, 0] - Y[0, 0]   # dy < 0: row 0 is the top
     if kind == "divergence":
         q = np.gradient(U, dx, axis=1) + np.gradient(V, dy, axis=0)
@@ -67,7 +88,7 @@ def heatmap(field, view, t, kind, vref, res=3):
     # The floor keeps round-off noise of a divergence- or curl-free field at the neutral color.
     ref = max(float(np.percentile(np.abs(q), 95)), 1e-3 * vref * view.scale / view.h)
     idx = ((np.clip(q / ref, -1, 1) + 1) * 127.5).astype(np.uint8)
-    return Image.fromarray(DIV[idx])
+    return Image.fromarray(PALETTES[palette].div[idx])
 
 
 def draw_axes(d, view, ss, grid):
@@ -95,7 +116,7 @@ def _head(d, tip, direction, size, color):
     d.polygon([tuple(tip), (bx - uy * hw, by + ux * hw), (bx + uy * hw, by - ux * hw)], fill=color)
 
 
-def draw_arrows(d, field, view, t, vref, spacing, length, equal, colored, ss):
+def draw_arrows(d, field, view, t, vref, spacing, length, equal, colored, ss, palette="studio"):
     nx, ny = max(1, round(view.w / spacing)), max(1, round(view.h / spacing))
     X, Y = view.grid(nx, ny)
     U, V = field(X, Y, t)
@@ -110,7 +131,7 @@ def draw_arrows(d, field, view, t, vref, spacing, length, equal, colored, ss):
     with np.errstate(all="ignore"):
         ux, uy = np.nan_to_num(U / m), np.nan_to_num(-V / m)
     px, py = view.to_px(X.ravel(), Y.ravel())
-    colors = vector_colors(rel, colored)
+    colors = vector_colors(rel, colored, palette)
     width = max(1, round(1.5 * ss))
     for i in np.flatnonzero(L > 2):
         hl = min(max(0.35 * L[i], 3.0), 8.0)
@@ -123,7 +144,7 @@ def draw_arrows(d, field, view, t, vref, spacing, length, equal, colored, ss):
         _head(d, tip * ss, (dx, dy), hl * ss, c)
 
 
-def draw_lines(d, lines, vref, colored, heads, ss, width=1.3, color=None):
+def draw_lines(d, lines, vref, colored, heads, ss, width=1.3, color=None, palette="studio"):
     """Streamlines from field.streamlines(). With `color`, every line gets that color."""
     w = max(1, round(width * ss))
     plain = color or hex_to_rgb(TEXT)
@@ -132,7 +153,7 @@ def draw_lines(d, lines, vref, colored, heads, ss, width=1.3, color=None):
             continue
         p = pts * ss
         if colored and color is None:
-            cols = vector_colors(speed / vref, True)
+            cols = vector_colors(speed / vref, True, palette)
             for s in range(0, len(p) - 1, 6):
                 c = tuple(int(v) for v in cols[s:s + 7].mean(axis=0))
                 d.line(p[s:s + 7].ravel().tolist(), fill=c, width=w, joint="curve")
@@ -150,17 +171,17 @@ def draw_lines(d, lines, vref, colored, heads, ss, width=1.3, color=None):
 
 
 def compose(field, view, t, vref, background="none", arrows=None, lines=None, traces=(),
-            colored=True, heads=True, ss=2):
+            colored=True, heads=True, ss=2, palette="studio"):
     """The static layer: background, axes, streamlines, arrows and traced lines, drawn at `ss`× and
     scaled down for antialiasing. `arrows` holds the draw_arrows settings, or None to skip them."""
     colored = colored and background == "none"   # on a heatmap, vectors are drawn in plain light color
-    img = heatmap(field, view, t, background, vref).resize((view.w * ss, view.h * ss), Image.BILINEAR)
+    img = heatmap(field, view, t, background, vref, palette).resize((view.w * ss, view.h * ss), Image.BILINEAR)
     d = ImageDraw.Draw(img)
     draw_axes(d, view, ss, grid=background == "none")
     if lines:
-        draw_lines(d, lines, vref, colored, heads, ss)
+        draw_lines(d, lines, vref, colored, heads, ss, palette=palette)
     if arrows:
-        draw_arrows(d, field, view, t, vref, colored=colored, ss=ss, **arrows)
+        draw_arrows(d, field, view, t, vref, colored=colored, ss=ss, palette=palette, **arrows)
     if traces:
         draw_lines(d, traces, vref, False, True, ss, width=2.4, color=(255, 255, 255))
     if ss > 1:

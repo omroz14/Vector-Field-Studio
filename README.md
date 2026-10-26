@@ -10,6 +10,7 @@ It shares its look with Pixel Sort Studio.
 - **Your own equations** for Fx and Fy, using `x, y, t, r, theta`, the usual math functions, `pi`, `e`. `^` means power.
 - **Three views:** arrows, evenly spaced streamlines and animated particles with trails.
 - **Background maps:** speed |F|, divergence or curl.
+- **Six color palettes:** Studio, Viridis, Magma, Ice, Fire and Turbo.
 - **Interaction:** scroll to zoom, drag to pan, click to trace the streamline through a point.
   The probe shows F, |F|, div F and curl F under the cursor.
 - **Time:** fields that use `t` evolve while playing.
@@ -33,6 +34,7 @@ Tkinter is a system package: `sudo apt install python3-tk` on Debian / Ubuntu / 
 | Space | play / pause |
 | 1–3 | arrows / streamlines / particles |
 | B | next background map |
+| P | next color palette |
 | R | reset view |
 | C | clear traced streamlines |
 | T | reset time |
