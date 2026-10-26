@@ -201,7 +201,7 @@ For a field F = (Fx, Fy):
 ## More projects
 
 - [Pixel Sort Studio](https://github.com/omroz14/pixel-sort-studio): sort the pixels of a photo along any direction.
-- [Pixel Merger](https://github.com/omroz14/pixel-merger): rebuild one image out of the pixels of another.
+- [Pixel Merger Studio](https://github.com/omroz14/pixel-merger-studio): rebuild one image out of the pixels of another.
 
 ## License
 
