@@ -23,7 +23,7 @@ ARROWS, STREAMLINES, PARTICLES = "Arrows", "Streamlines", "Particles"
 MODES = (ARROWS, STREAMLINES, PARTICLES)
 BACKGROUNDS = (("none", "None"), ("magnitude", "|F|"), ("divergence", "div F"), ("curl", "curl F"))
 BG_NOTES = {
-    "none": "Plain background. Vectors are colored by their length.",
+    "none": "Plain background. Vectors are coloured by their length.",
     "magnitude": "Brightness shows the speed |F|.",
     "divergence": "Where the field spreads out (source) or converges (sink).",
     "curl": "Which way the field rotates: clockwise or counter-clockwise.",
@@ -175,7 +175,7 @@ class App(ctk.CTk):
     def _build_right(self, right):
         """How to show it: colors, arrows, streamlines, particles, the probe and export."""
         # COLORS
-        c = card(right, "COLORS", "keys B, P")
+        c = card(right, "COLOURS", "keys B, P")
         self.bg_tabs = segmented(c, [lbl for _, lbl in BACKGROUNDS],
                                  lambda v: self.set_background(_key(BACKGROUNDS, v)))
         self.bg_tabs.set(_label(BACKGROUNDS, self.bg_kind))
@@ -195,7 +195,7 @@ class App(ctk.CTk):
         self.lbl_scale[2].pack(side="right")
         self.lbl_scale[1].place(relx=0.5, rely=0, anchor="n")
         self.lbl_bg = note(c, BG_NOTES[self.bg_kind], pady=(4, 8))
-        switch(c, "Color vectors by speed", self.colored, self._invalidate).pack(anchor="w", padx=PAD)
+        switch(c, "Colour vectors by speed", self.colored, self._invalidate).pack(anchor="w", padx=PAD)
         note(c, "On a background map, vectors are drawn in white.", pady=(4, PAD))
 
         # ARROWS
@@ -626,7 +626,7 @@ class App(ctk.CTk):
             self.set_mode(PARTICLES)      # a steady field only moves through its particles
         self.running = True
         self.btn_play.configure(text="❚❚  Pause")
-        self._status("Playing. Particles follow the field; their color shows the speed.")
+        self._status("Playing. Particles follow the field; their colour shows the speed.")
         self._tick()
 
     def _stop(self):

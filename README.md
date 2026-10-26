@@ -41,6 +41,7 @@ It shares its look with [Pixel Sort Studio](https://github.com/omroz14/Pixel-sor
 - [Controls](#controls)
 - [The maths](#the-maths)
 - [Troubleshooting](#troubleshooting)
+- [More projects](#more-projects)
 - [License](#license)
 
 ## Features
@@ -132,7 +133,8 @@ Type expressions for **Fx** and **Fy** and press `Enter` to apply them.
 | `sinh cosh tanh exp log log10 sqrt` | Other functions |
 | `abs sign floor min max hypot` | Utilities |
 
-`^` means power, so `x^2` is x². Only these names are allowed, so expressions are evaluated safely.
+`^` means power, so `x^2` is x². Comparisons give 0 or 1, so `(x > 0)*x` is a piecewise field.
+Only these names are allowed, so expressions are evaluated safely.
 
 **Examples**
 
@@ -199,6 +201,11 @@ For a field F = (Fx, Fy):
 | `CustomTkinter is not installed` | Activate the virtual environment, then run `pip install -r requirements.txt`. |
 | `py` or `python` is not recognised (Windows) | Reinstall Python and tick **Add python.exe to PATH**. |
 | My equation is rejected | Check that you only use the names listed in [Writing your own field](#writing-your-own-field), and use `*` for multiplication (`2*x`, not `2x`). |
+
+## More projects
+
+- [Pixel Sort Studio](https://github.com/omroz14/Pixel-sorter): sort the pixels of a photo along any direction.
+- [Pixel Merger](https://github.com/omroz14/Pixel-Merger): rebuild one image out of the pixels of another.
 
 ## License
 
