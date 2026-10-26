@@ -22,6 +22,16 @@ It shares its look with [Pixel Sort Studio](https://github.com/omroz14/Pixel-sor
 |:---:|:---:|:---:|
 | ![Arrow view](docs/images/view-arrows.png) | ![Streamline view](docs/images/view-streamlines.png) | ![Particle view](docs/images/view-particles.png) |
 
+## Demo
+
+<!-- Put the GIFs in docs/images/ with these names. -->
+
+![Vector Field Studio animation](docs/images/demo.gif)
+
+| Particles | Double gyre | Custom field |
+|:---:|:---:|:---:|
+| ![Particle trails](docs/images/anim-particles.gif) | ![Double gyre over time](docs/images/anim-double-gyre.gif) | ![Custom equations](docs/images/anim-custom.gif) |
+
 ## Contents
 
 - [Features](#features)
