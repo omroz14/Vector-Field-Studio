@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 from PIL import Image, ImageDraw
 
+import field as fieldmod
 from theme import *
 
 GRID = "#1b1f2a"   # faint grid lines on the plain background
@@ -244,3 +245,24 @@ def screen(a, b):
     a = a.astype(np.uint16)
     b = b.astype(np.uint16)
     return (a + b - (a * b + 127) // 255).astype(np.uint8)
+
+
+def build_static(field, view, t, style, arrows=False, streamlines=False, grid_needed=False, pins=(), ss=2,
+                 guides=True, vref=None):
+    """Samples the field and draws the static layer of `view`. Returns (image, grid or None, vref).
+    `pins` are world points with a traced streamline; `grid_needed` asks for the grid even if nothing drawn
+    here reads it (the particles do). vref defaults to the typical speed in the view."""
+    if vref is None:
+        vref = fieldmod.reference_speed(field, view, t)
+    grid = None
+    if grid_needed or streamlines or style.background != "none" or len(pins):
+        grid = fieldmod.FieldGrid(field, view, t, spacing=style.px(style.sample))
+    lines = None
+    if streamlines:
+        lines = fieldmod.streamlines(grid, view, vref, style.px(style.stream_sep), style.px(style.step))
+    traces = ()
+    if len(pins):
+        pts = np.array([view.to_px(x, y) for x, y in pins])
+        traces = fieldmod.trace_through(grid, view, vref, pts, style.px(1.0))
+    img = compose(field, grid, view, t, vref, style, arrows, lines, traces, ss=ss, guides=guides)
+    return img, grid, vref

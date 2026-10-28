@@ -10,6 +10,7 @@ import customtkinter as ctk
 import numpy as np
 from PIL import Image, ImageTk
 
+import export
 import field as fieldmod
 import particles
 import render
@@ -20,8 +21,7 @@ FPS = 30           # frames per second of the animation (and of the GIF)
 PANEL_W = 290      # width of each side panel (px)
 QUICK_MS = 220     # quiet time after an interaction before the full-quality redraw
 POLL_MS = 8        # how often the Tk thread looks for finished renders
-GIF_FRAMES = 120
-GIF_MAX = 560      # longest side of an exported GIF (px)
+EXPORT_POLL_MS = 100
 HALF_MIN, HALF_MAX = 0.25, 79.0   # zoom limits: half of the view height in world units
 
 ARROWS, STREAMLINES, PARTICLES = "Arrows", "Streamlines", "Particles"
@@ -107,13 +107,20 @@ class App(ctk.CTk):
         self.overlay = tk.BooleanVar(value=False)    # arrows in every view
         self.stream_sep = 22
         self.stream_heads = tk.BooleanVar(value=True)
-        self.n_particles = 2000
+        self.density = 25               # particles per 100 × 100 points, on the stage and in exports
         self.p_speed = 3                # × 30 points per second at the typical speed (steady fields)
         self.trail_s = 0.65             # seconds: how long trails take to fade
         self.t_rate = 0.5               # units of t per second (fields that use t)
         self.pins = []                  # world points with a traced streamline
 
         self.flow = None                # particles and their trails (particles.Flow)
+        self.ex_size = "4:5"            # export: key of export.SIZES
+        self.ex_format = "mp4"
+        self.ex_fps = 30
+        self.ex_seconds = 10
+        self.ex_ss = 2                  # supersampling of the static layer
+        self.ex_grid = tk.BooleanVar(value=False)
+        self._export = None             # the running export.Export
         self._worker = worker.Worker()  # builds static layers off the Tk thread
         self._gen = 0                   # number of the newest static layer asked for
         self._static = None             # newest finished Static: background + vectors, maybe for an older view
@@ -242,7 +249,8 @@ class App(ctk.CTk):
 
         # PARTICLES
         c = card(right, "PARTICLES", "Space")
-        self.row_count = SliderRow(c, "Count", 100, 6000, self.n_particles, self._on_count)
+        self.row_density = SliderRow(c, "Density", 2, 80, self.density, self._on_density,
+                                     fmt=lambda v: f"{v} per 100² pt")
         self.row_speed = SliderRow(c, "Speed", 1, 12, self.p_speed, self._on_speed, fmt=lambda v: f"{v}×")
         self.row_trail = SliderRow(c, "Trail", 0, 300, round(self.trail_s * 100), self._on_trail,
                                    fmt=lambda v: "none" if v == 0 else f"{v / 100:.2f} s")
@@ -260,11 +268,33 @@ class App(ctk.CTk):
         ctk.CTkFrame(c, fg_color="transparent", height=PAD - 4).pack()
 
         # EXPORT
-        c = card(right, "EXPORT")
+        c = card(right, "EXPORT", "Ctrl+E")
+        self.ex_size_tabs = segmented(c, [k for k, _, _ in export.SIZES], self._on_ex_size)
+        self.ex_size_tabs.set(self.ex_size)
+        self.ex_size_tabs.pack(fill="x", padx=PAD, pady=(0, 6))
+        self.ex_format_tabs = segmented(c, [lbl for _, lbl in export.FORMATS],
+                                        lambda v: self._on_ex_format(_key(export.FORMATS, v)))
+        self.ex_format_tabs.set(_label(export.FORMATS, self.ex_format))
+        self.ex_format_tabs.pack(fill="x", padx=PAD, pady=(0, 6))
+        row = ctk.CTkFrame(c, fg_color="transparent")
+        row.pack(fill="x", padx=PAD, pady=(0, 2))
+        self.ex_fps_tabs = segmented(row, ("30 fps", "60 fps"), self._on_ex_fps)
+        self.ex_fps_tabs.set(f"{self.ex_fps} fps")
+        self.ex_fps_tabs.pack(side="left", fill="x", expand=True)
+        self.ex_ss_tabs = segmented(row, ("2×", "3×"), self._on_ex_ss)
+        self.ex_ss_tabs.set(f"{self.ex_ss}×")
+        self.ex_ss_tabs.pack(side="left", padx=(6, 0))
+        self.row_seconds = SliderRow(c, "Duration", 1, 30, self.ex_seconds, self._on_ex_seconds,
+                                     fmt=lambda v: f"{v} s")
+        switch(c, "Include grid and axes", self.ex_grid, lambda: None).pack(anchor="w", padx=PAD, pady=(8, 0))
+        self.lbl_ex = note(c, "", pady=(6, 8))
         ex = ctk.CTkFrame(c, fg_color="transparent")
         ex.pack(fill="x", padx=PAD, pady=(0, PAD))
-        button(ex, "Save PNG", self.save_png, width=10).pack(side="left", fill="x", expand=True)
-        button(ex, "Save GIF", self.save_gif, width=10).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.btn_export = button(ex, "Export video", self.export_video, accent=True, width=10)
+        self.btn_export.pack(side="left", fill="x", expand=True)
+        button(ex, "Save PNG", self.save_png, width=10).pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.ex_progress = ctk.CTkProgressBar(c, height=6, fg_color=SURFACE_2, progress_color=ACCENT)
+        self._ex_note()
 
     def _build_main(self):
         """The center: view tabs, the stage and the play bar."""
@@ -324,6 +354,8 @@ class App(ctk.CTk):
         for seq, fn in keys.items():
             self.bind(seq, self._unless_typing(fn))
         self.bind("<Control-s>", lambda e: self.save_png())
+        self.bind("<Control-e>", lambda e: self.export_video())
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         for i, m in enumerate(MODES, 1):
             self.bind(f"<Key-{i}>", self._unless_typing(lambda m=m: self.set_mode(m)))
 
@@ -424,10 +456,43 @@ class App(ctk.CTk):
         self.stream_sep = v
         self._invalidate(quick=True)
 
-    def _on_count(self, v):
-        self.n_particles = v
+    def _on_density(self, v):
+        self.density = v
         self.flow = None
         self._invalidate(static=False)
+
+    def _on_ex_size(self, key):
+        self.ex_size = key
+        self._ex_note()
+        self._invalidate(static=False)   # moves the export frame on the stage
+
+    def _on_ex_format(self, key):
+        self.ex_format = key
+        self._ex_note()
+
+    def _on_ex_fps(self, label):
+        self.ex_fps = int(label.split()[0])
+        self._ex_note()
+
+    def _on_ex_ss(self, label):
+        self.ex_ss = int(label.rstrip("×"))
+
+    def _on_ex_seconds(self, v):
+        self.ex_seconds = v
+        self._ex_note()
+
+    def _ex_dims(self):
+        return next((w, h) for k, w, h in export.SIZES if k == self.ex_size)
+
+    def _ex_note(self):
+        w, h = self._ex_dims()
+        text = f"{w} × {h} px, {self.ex_fps} fps, {self.ex_seconds} s: the dashed frame on the stage."
+        if self.ex_format == "gif":
+            text = (f"GIF preview: {min(w, export.GIF_WIDTH)} px wide, {50 if self.ex_fps > 30 else 25} fps "
+                    f"(GIF counts time in 1/100 s), {self.ex_seconds} s.")
+        elif self.ex_format == "png":
+            text += " One PNG per frame, numbered."
+        self.lbl_ex.configure(text=text)
 
     def _on_speed(self, v):
         self.p_speed = v
@@ -558,19 +623,8 @@ class App(ctk.CTk):
 
         def build():
             try:
-                vref = fieldmod.reference_speed(field, view, t)
-                grid = None
-                if mode != ARROWS or style.background != "none" or pins:
-                    grid = fieldmod.FieldGrid(field, view, t, spacing=style.px(style.sample))
-                lines = None
-                if mode == STREAMLINES:
-                    lines = fieldmod.streamlines(grid, view, vref, style.px(style.stream_sep), style.px(style.step))
-                traces = ()
-                if pins:
-                    pts = np.array([view.to_px(x, y) for x, y in pins])
-                    traces = fieldmod.trace_through(grid, view, vref, pts, style.px(1.0))
-                img = render.compose(field, grid, view, t, vref, style, arrows, lines, traces,
-                                     ss=1 if quick else 2, guides=guides)
+                img, grid, _ = render.build_static(field, view, t, style, arrows, mode == STREAMLINES,
+                                                   mode == PARTICLES, pins, 1 if quick else 2, guides)
                 return Static(gen, view, img, grid)
             except ValueError as exc:
                 return Static(gen, view, error=f"Could not evaluate the field: {exc}")
@@ -656,6 +710,10 @@ class App(ctk.CTk):
         s = self.stage
         s.delete("all")
         s.create_image(0, 0, image=self._photo, anchor="nw")
+        w, h = self._ex_dims()
+        x, y, fw, fh = export.frame_rect(view, w, h)
+        s.create_rectangle(x, y, x + fw, y + fh, outline=MUTED, dash=(6, 4))
+        s.create_text(x + fw - 6, y + 6, anchor="ne", fill=MUTED, font=FONT_SMALL, text=f"{self.ex_size} · {w} × {h}")
         self._draw_ticks(view)
         s.create_text(10, 6, anchor="nw", fill=MUTED, font=FONT_SECTION, text=self._caption())
 
@@ -688,7 +746,7 @@ class App(ctk.CTk):
         if self.flow is not None and (self.flow.view.w, self.flow.view.h) == (view.w, view.h):
             self.flow.view = view
             return
-        self.flow = particles.Flow(self.n_particles, view, FPS)
+        self.flow = particles.Flow(round(self.density * view.w * view.h / 1e4), view, FPS)
         self.flow.paint(self.field, self.t, fieldmod.reference_speed(self.field, view, self.t), self._style())
 
     def _step(self, view, static=None):
@@ -749,63 +807,77 @@ class App(ctk.CTk):
 
     # ---------- files ----------
 
-    def _art(self, view, quick=False):
-        """The static layer without guides, built on this thread: exports must not use a stale one."""
-        st = self._static_job(view, quick, guides=False)()
-        if st.error:
-            raise ValueError(st.error)
-        return st
+    def _scene(self):
+        """What the stage shows now, for an export."""
+        return export.Scene(self.field, self._style(), self.t, self.t_rate,
+                            arrows=self.mode == ARROWS or self.overlay.get(), streamlines=self.mode == STREAMLINES,
+                            density=self.density if self.mode == PARTICLES else 0, pins=tuple(self.pins))
+
+    def _ex_settings(self, fmt):
+        w, h = self._ex_dims()
+        return export.Settings(w, h, self.ex_fps, self.ex_seconds, fmt, self.ex_ss, self.ex_grid.get())
 
     def save_png(self):
-        if self._frame is None:
+        """A still of the export frame at the export size."""
+        if self.field is None or self._export is not None:
             return
         path = filedialog.asksaveasfilename(title="Save image", defaultextension=".png",
                                             initialfile="vector_field.png", filetypes=[("PNG", "*.png")])
-        if not path:
-            return
-        view = self._view()
-        try:
-            art = self._art(view)
-        except ValueError as exc:
-            self._status(str(exc))
-            return
-        Image.fromarray(self._compose(view, art.img)).save(path)
-        self._status(f"Saved: {os.path.basename(path)}")
+        if path:
+            self._start_export(self._ex_settings("still"), path)
 
-    def save_gif(self):
+    def export_video(self):
+        if self._export is not None:
+            self._export.cancel.set()
+            return
         if self.field is None:
             return
-        path = filedialog.asksaveasfilename(title="Save animation", defaultextension=".gif",
-                                            initialfile="vector_field.gif", filetypes=[("GIF", "*.gif")])
+        ext = export.EXTENSIONS[self.ex_format]
+        label = _label(export.FORMATS, self.ex_format)
+        path = filedialog.asksaveasfilename(title="Export video", defaultextension=ext,
+                                            initialfile=f"vector_field{ext}", filetypes=[(label, f"*{ext}")])
         if not path:
             return
-        self._stop()
         if self.mode != PARTICLES and not self.field.uses_t:
-            self.set_mode(PARTICLES)
-        view = self._view()
-        try:
-            art = self._art(view)
-        except ValueError as exc:
-            self._status(str(exc))
+            self.set_mode(PARTICLES)      # a steady field only moves through its particles
+        self._start_export(self._ex_settings(self.ex_format), path)
+
+    def _start_export(self, settings, path):
+        self._export = export.Export(export.Renderer(self._scene(), self._view(), settings), path)
+        if settings.format != "still":
+            self.btn_export.configure(text="Cancel")
+        self.ex_progress.set(0)
+        self.ex_progress.pack(fill="x", padx=PAD, pady=(0, PAD))
+        self.after(EXPORT_POLL_MS, self._poll_export)
+
+    def _poll_export(self):
+        ex = self._export
+        name = os.path.basename(ex.path)
+        if not ex.finished:
+            self.ex_progress.set(ex.done / ex.total)
+            warm = ex.renderer.warm_up
+            phase = (f"growing the trails ({ex.done} / {warm})" if ex.done < warm
+                     else f"frame {ex.done - warm + 1} / {ex.settings.frames}")
+            self._status(f"Exporting {name}: {phase}…")
+            self.after(EXPORT_POLL_MS, self._poll_export)
             return
-        frames = []
-        for i in range(GIF_FRAMES):
-            self._step(view, art)
-            if self.field.uses_t:
-                art = self._art(view, quick=True)
-            img = Image.fromarray(self._compose(view, art.img))
-            img.thumbnail((GIF_MAX, GIF_MAX), Image.LANCZOS)
-            frames.append(img)
-            if i % 10 == 0:
-                self._status(f"Recording frame {i + 1} / {GIF_FRAMES}…")
-                self.update_idletasks()
-        # One shared palette and no dithering keep the file small: noisy dithered trails compress badly.
-        pal = frames[-1].quantize(colors=64, dither=Image.Dither.NONE)
-        frames = [f.quantize(palette=pal, dither=Image.Dither.NONE) for f in frames]
-        frames[0].save(path, save_all=True, append_images=frames[1:], duration=round(1000 / FPS), loop=0)
-        self.lbl_t.configure(text=f"t = {self.t:.2f}")
-        self._invalidate()
-        self._status(f"Saved animation: {os.path.basename(path)}")
+        self._export = None
+        self.btn_export.configure(text="Export video")
+        self.ex_progress.pack_forget()
+        if ex.error:
+            self._status(f"Export failed: {ex.error}")
+        elif ex.cancelled:
+            self._status("Export cancelled.")
+        else:
+            self._status(f"Saved: {name}")
+
+    def _on_close(self):
+        """Cancels a running export first, so ffmpeg is not left behind with half a file."""
+        if self._export is not None and not self._export.finished:
+            self._export.cancel.set()
+            self.after(50, self._on_close)
+            return
+        self.destroy()
 
     def _status(self, text):
         self.lbl_status.configure(text=text)
