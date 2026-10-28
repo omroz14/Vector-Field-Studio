@@ -2,6 +2,7 @@
 import math
 import os
 import tkinter as tk
+import traceback
 from tkinter import filedialog
 
 import customtkinter as ctk
@@ -10,11 +11,13 @@ from PIL import Image, ImageTk
 
 import field as fieldmod
 import render
+import worker
 from theme import *
 
 TICK_MS = 33       # ~30 frames per second
 PANEL_W = 290      # width of each side panel (px)
 QUICK_MS = 220     # quiet time after an interaction before the full-quality redraw
+POLL_MS = 8        # how often the Tk thread looks for finished renders
 GIF_FRAMES = 120
 GIF_MAX = 560      # longest side of an exported GIF (px)
 HALF_MIN, HALF_MAX = 0.25, 79.0   # zoom limits: half of the view height in world units
@@ -35,6 +38,13 @@ BG_SCALE = {   # colorbar labels: left, middle, right
     "curl": ("clockwise", "0", "counter-cw"),
 }
 PROBE_ROWS = ("x, y", "F", "|F|", "Angle", "div F", "curl F")
+
+
+class Static:
+    """A finished static layer: the image for `view`, and the sampled field grid (None if nothing needed it)."""
+
+    def __init__(self, gen, view, img=None, grid=None, error=None):
+        self.gen, self.view, self.img, self.grid, self.error = gen, view, img, grid, error
 
 
 def _label(options, key):
@@ -93,10 +103,14 @@ class App(ctk.CTk):
 
         self.parts = fieldmod.Particles()
         self.trail = None               # particle trails, float32 (h, w, 3)
-        self._static = None             # background + vectors, uint8 (h, w, 3)
+        self._worker = worker.Worker()  # builds static layers off the Tk thread
+        self._gen = 0                   # number of the newest static layer asked for
+        self._static = None             # newest finished Static: background + vectors, maybe for an older view
+        self._fitted = None             # (Static, view key, its image fitted to that view)
+        self._poll_id = None
+        self._compiling = False         # the first run compiles the numba kernels: a note says so
         self._frame = None              # what the stage shows now
         self._photo = None
-        self._quick = False
         self.running = False
         self._after_id = None
         self._redraw_id = None
@@ -109,6 +123,7 @@ class App(ctk.CTk):
         self.set_preset(self.preset)
         self.set_mode(ARROWS)
         self._status("Pick a preset or type your own Fx and Fy. Space animates the flow.")
+        self.after(800, self._compiling_note)
 
     # ---------- building the interface ----------
 
@@ -486,11 +501,11 @@ class App(ctk.CTk):
     # ---------- rendering ----------
 
     def _invalidate(self, quick=False, static=True):
-        """Schedules a redraw. `quick` draws at lower quality now and at full quality once things settle."""
+        """Schedules a redraw; with `static`, also a new static layer. A `quick` one is drawn at lower
+        quality now and at full quality once things settle."""
         if static:
-            self._static = None
+            self._request(quick)
         if quick:
-            self._quick = True
             if self._full_id is not None:
                 self.after_cancel(self._full_id)
             self._full_id = self.after(QUICK_MS, self._full_redraw)
@@ -499,49 +514,120 @@ class App(ctk.CTk):
 
     def _full_redraw(self):
         self._full_id = None
-        self._quick = False
-        self._static = None
-        self._redraw()
+        self._request(quick=False)
 
     def _redraw(self):
         self._redraw_id = None
         if not self.running and self.field is not None:   # while playing, every tick redraws
-            self._show(self._view(), self._quick)
+            self._show(self._view())
 
-    def _build_static(self, view, quick):
-        t = self.t
-        try:
-            vref = fieldmod.reference_speed(self.field, view, t)
-            lines = None
-            if self.mode == STREAMLINES:
-                lines = fieldmod.streamlines(self.field, view, t, vref, self.stream_sep, step=6 if quick else 3)
-            traces = ()
-            if self.pins:
-                pts = np.array([view.to_px(x, y) for x, y in self.pins])
-                traces = fieldmod.trace_through(self.field, view, t, vref, pts, step=4 if quick else 2)
-            arrows = None
-            if self.mode == ARROWS or self.overlay.get():
-                arrows = dict(spacing=self.arrow_spacing, length=self.arrow_len / 100, equal=self.equal_len.get())
-            self._static = render.compose(self.field, view, t, vref, self.bg_kind, arrows, lines, traces,
-                                          colored=self.colored.get(), heads=self.stream_heads.get(),
-                                          palette=self.palette,
-                                          ss=1 if quick else 2)
-        except ValueError as exc:
-            self._status(f"Could not evaluate the field: {exc}")
-            self._static = np.full((view.h, view.w, 3), hex_to_rgb(SURFACE), np.uint8)
+    def _static_job(self, view, quick):
+        """A snapshot of everything the static layer depends on, as a job for the render thread."""
+        gen, field, t, mode, bg = self._gen, self.field, self.t, self.mode, self.bg_kind
+        pins, sep, palette = list(self.pins), self.stream_sep, self.palette
+        colored, heads = self.colored.get(), self.stream_heads.get()
+        arrows = None
+        if mode == ARROWS or self.overlay.get():
+            arrows = dict(spacing=self.arrow_spacing, length=self.arrow_len / 100, equal=self.equal_len.get())
 
-    def _compose(self, view, quick=False):
+        def build():
+            try:
+                vref = fieldmod.reference_speed(field, view, t)
+                grid = None
+                if mode != ARROWS or bg != "none" or pins:
+                    grid = fieldmod.FieldGrid(field, view, t)
+                lines = fieldmod.streamlines(grid, view, vref, sep) if mode == STREAMLINES else None
+                traces = ()
+                if pins:
+                    pts = np.array([view.to_px(x, y) for x, y in pins])
+                    traces = fieldmod.trace_through(grid, view, vref, pts)
+                img = render.compose(field, grid, view, t, vref, bg, arrows, lines, traces, colored=colored,
+                                     heads=heads, palette=palette, ss=1 if quick else 2)
+                return Static(gen, view, img, grid)
+            except ValueError as exc:
+                return Static(gen, view, error=f"Could not evaluate the field: {exc}")
+            except Exception as exc:
+                traceback.print_exc()
+                return Static(gen, view, error=f"Rendering failed: {exc}")
+        return build
+
+    def _request(self, quick=False):
+        """Asks the render thread for a static layer of the current view and settings."""
+        if self.field is None:
+            return
+        self._gen += 1
+        self._worker.submit(self._static_job(self._view(), quick))
+        if self._poll_id is None:
+            self._poll_id = self.after(POLL_MS, self._poll)
+
+    def _build_now(self, view, quick=False):
+        """Builds the static layer on this thread (for exports, which must not use a stale one)."""
+        self._gen += 1
+        self._accept(self._static_job(view, quick)())
+
+    def _poll(self):
+        self._poll_id = None
+        got = None
+        while not self._worker.results.empty():
+            got = self._worker.results.get()
+        if got is not None:
+            self._accept(got)
+            if not self.running:
+                self._redraw()
+        if self._static is None or self._static.gen < self._gen:
+            self._poll_id = self.after(POLL_MS, self._poll)
+
+    def _accept(self, static):
+        if isinstance(static, Exception):
+            self._status(f"Rendering failed: {static}")
+            return
+        if self._static is not None and static.gen < self._static.gen:
+            return
+        if static.error:
+            self._status(static.error)
+            static.img = np.full((static.view.h, static.view.w, 3), hex_to_rgb(SURFACE), np.uint8)
+        if self._static is None and self._compiling:
+            self._compiling = False
+            self._status("Ready. Pick a preset or type your own Fx and Fy. Space animates the flow.")
+        self._static = static
+
+    def _compiling_note(self):
+        self._compiling = self._static is None
+        if self._compiling:
+            self._status("Compiling the numerical kernels. This happens only on the first run and takes a few seconds…")
+
+    def _fit_static(self, view):
+        """The newest static layer as seen from `view`. One built for an older view (the user is panning or
+        zooming and the new one is not ready yet) is moved and scaled to match, so it never lags behind."""
+        st = self._static
+        if st is None:
+            return np.full((view.h, view.w, 3), hex_to_rgb(SURFACE), np.uint8)
+        key = (view.cx, view.cy, view.scale, view.w, view.h)
+        if self._fitted is not None and self._fitted[0] is st and self._fitted[1] == key:
+            return self._fitted[2]
+        old = st.view
+        if (old.cx, old.cy, old.scale, old.w, old.h) == key:
+            img = st.img
+        else:
+            k = old.scale / view.scale
+            c = (view.cx - view.w / (2 * view.scale) - old.cx) * old.scale + old.w / 2
+            f = old.h / 2 - (view.cy - old.cy) * old.scale - view.h / 2 * k
+            img = np.asarray(Image.fromarray(st.img).transform(
+                (view.w, view.h), Image.AFFINE, (k, 0, c, 0, k, f), Image.BILINEAR, fillcolor=SURFACE))
+        self._fitted = (st, key, img)
+        return img
+
+    def _compose(self, view):
         """The frame to show: the static layer, plus particle trails in the Particles view."""
-        if self._static is None or self._static.shape[:2] != (view.h, view.w):
-            self._build_static(view, quick)
+        static = self._fit_static(view)
         if self.mode != PARTICLES:
-            return self._static
+            return static
         if self.trail is None or self.trail.shape[:2] != (view.h, view.w):
             self._reset_particles(view)
-        return np.maximum(self._static, self.trail.astype(np.uint8))
+        return np.maximum(static, self.trail.astype(np.uint8))
 
-    def _show(self, view, quick=False):
-        self._frame = self._compose(view, quick)
+    def _show(self, view):
+        self._frame = self._compose(view)
         self._photo = ImageTk.PhotoImage(Image.fromarray(self._frame))
         s = self.stage
         s.delete("all")
@@ -598,11 +684,12 @@ class App(ctk.CTk):
         """Advances time by one frame, and the particles with it in the Particles view."""
         vref = fieldmod.reference_speed(self.field, view, self.t)
         dt = self.p_speed / (vref * view.scale)    # a particle at the typical speed moves p_speed px
-        if self.mode == PARTICLES:
+        grid = self._static.grid if self._static is not None else None
+        if self.mode == PARTICLES and grid is not None:   # no grid yet: the first render is still running
             if self.trail is None or self.trail.shape[:2] != (view.h, view.w):
                 self._reset_particles(view)
             self.trail *= 1 - 1 / self.trail_len
-            old, speed, dead = self.parts.step(self.field, view, self.t, dt)
+            old, speed, dead = self.parts.step(grid, view, dt)
             keep = ~dead
             ox, oy = view.to_px(*old[keep].T)
             nx, ny = view.to_px(*self.parts.pos[keep].T)
@@ -614,13 +701,13 @@ class App(ctk.CTk):
                 a = k / nsub
                 self._dot((ox + a * (nx - ox)).astype(int), (oy + a * (ny - oy)).astype(int), col)
         self.t += dt
-        if self.field.uses_t:
-            self._static = None
 
     def toggle_play(self):
         if self.running:
             self._stop()
             self._status("Paused.")
+            if self.field.uses_t:
+                self._invalidate()        # frames while playing were quick ones
             return
         if self.mode != PARTICLES and not self.field.uses_t:
             self.set_mode(PARTICLES)      # a steady field only moves through its particles
@@ -642,7 +729,9 @@ class App(ctk.CTk):
             return
         view = self._view()
         self._step(view)
-        self._show(view, quick=self._quick or self.field.uses_t)
+        if self.field.uses_t:
+            self._request(quick=True)     # shown by a later tick; until then the last one stays up
+        self._show(view)
         self.lbl_t.configure(text=f"t = {self.t:.2f}")
         self._after_id = self.after(TICK_MS, self._tick)
 
@@ -675,10 +764,13 @@ class App(ctk.CTk):
         if self.mode != PARTICLES and not self.field.uses_t:
             self.set_mode(PARTICLES)
         view = self._view()
+        self._build_now(view)
         frames = []
         for i in range(GIF_FRAMES):
             self._step(view)
-            img = Image.fromarray(self._compose(view, quick=self.field.uses_t))
+            if self.field.uses_t:
+                self._build_now(view, quick=True)
+            img = Image.fromarray(self._compose(view))
             img.thumbnail((GIF_MAX, GIF_MAX), Image.LANCZOS)
             frames.append(img)
             if i % 10 == 0:

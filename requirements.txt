@@ -4,3 +4,5 @@
 numpy>=1.24
 Pillow>=10.0
 customtkinter>=5.2
+numba>=0.59
+imageio-ffmpeg>=0.5

@@ -70,25 +70,34 @@ def ticks(view, target_px=90):
     return step, xs, ys
 
 
-def heatmap(field, view, t, kind, vref, palette="studio", res=3):
-    """Background image: plain, |F|, divergence or curl, computed on a coarse grid and scaled up later."""
+def _grid_to_view(img, grid, view, ss):
+    """Resamples an image of the grid (row 0 = top row of the grid) onto the view at ss× (bilinear)."""
+    ny = grid.U.shape[0]
+    k = 1 / (ss * view.scale * grid.h)   # grid nodes per output pixel
+    c = (view.cx - view.w / (2 * view.scale) - grid.x0) / grid.h + 0.5
+    f = ny - 0.5 - (view.cy + view.h / (2 * view.scale) - grid.y0) / grid.h
+    return img.transform((view.w * ss, view.h * ss), Image.AFFINE, (k, 0, c, 0, k, f), Image.BILINEAR)
+
+
+def heatmap(grid, view, kind, vref, palette="studio", ss=1):
+    """Background image at ss× the view: plain, |F|, divergence or curl, read from the sampled grid."""
     if kind == "none":
-        return Image.new("RGB", (view.w, view.h), SURFACE)
-    nx, ny = max(2, view.w // res), max(2, view.h // res)
-    X, Y = view.grid(nx, ny)
-    U, V = field(X, Y, t)
+        return Image.new("RGB", (view.w * ss, view.h * ss), SURFACE)
+    U, V = grid.U, grid.V
     if kind == "magnitude":
         idx = (np.clip(np.hypot(U, V) / vref, 0, 1) * MAG_TOP).astype(np.uint8)
-        return Image.fromarray(PALETTES[palette].seq[idx])
-    dx, dy = X[0, 1] - X[0, 0], Y[1, 0] - Y[0, 0]   # dy < 0: row 0 is the top
-    if kind == "divergence":
-        q = np.gradient(U, dx, axis=1) + np.gradient(V, dy, axis=0)
+        img = PALETTES[palette].seq[idx]
     else:
-        q = np.gradient(V, dx, axis=1) - np.gradient(U, dy, axis=0)
-    # The floor keeps round-off noise of a divergence- or curl-free field at the neutral color.
-    ref = max(float(np.percentile(np.abs(q), 95)), 1e-3 * vref * view.scale / view.h)
-    idx = ((np.clip(q / ref, -1, 1) + 1) * 127.5).astype(np.uint8)
-    return Image.fromarray(PALETTES[palette].div[idx])
+        h = grid.h   # rows grow with y, so both derivatives use +h
+        if kind == "divergence":
+            q = np.gradient(U, h, axis=1) + np.gradient(V, h, axis=0)
+        else:
+            q = np.gradient(V, h, axis=1) - np.gradient(U, h, axis=0)
+        # The floor keeps round-off noise of a divergence- or curl-free field at the neutral color.
+        ref = max(float(np.percentile(np.abs(q[::4, ::4]), 95)), 1e-3 * vref * view.scale / view.h)
+        idx = ((np.clip(q / ref, -1, 1) + 1) * 127.5).astype(np.uint8)
+        img = PALETTES[palette].div[idx]
+    return _grid_to_view(Image.fromarray(img[::-1]), grid, view, ss)
 
 
 def draw_axes(d, view, ss, grid):
@@ -148,34 +157,35 @@ def draw_lines(d, lines, vref, colored, heads, ss, width=1.3, color=None, palett
     """Streamlines from field.streamlines(). With `color`, every line gets that color."""
     w = max(1, round(width * ss))
     plain = color or hex_to_rgb(TEXT)
-    for pts, speed, mid in lines:
+    size = (4 + width * 2) * ss
+    for pts, speed, arrows in lines:
         if len(pts) < 2:
             continue
         p = pts * ss
         if colored and color is None:
             cols = vector_colors(speed / vref, True, palette)
-            for s in range(0, len(p) - 1, 6):
-                c = tuple(int(v) for v in cols[s:s + 7].mean(axis=0))
-                d.line(p[s:s + 7].ravel().tolist(), fill=c, width=w, joint="curve")
-            head_color = tuple(int(v) for v in cols[mid])
+            for s in range(0, len(p) - 1, 8):
+                c = tuple(int(v) for v in cols[s:s + 9].mean(axis=0))
+                d.line(p[s:s + 9].ravel().tolist(), fill=c, width=w, joint="curve")
         else:
             d.line(p.ravel().tolist(), fill=plain, width=w, joint="curve")
-            head_color = plain
-        if heads and len(p) > 10:
-            a, b = p[max(mid - 3, 0)], p[min(mid + 3, len(p) - 1)]
+        if not heads:
+            continue
+        for i in arrows:
+            a, b = p[max(i - 3, 0)], p[min(i + 3, len(p) - 1)]
             n = np.hypot(*(b - a))
             if n > 0:
                 u = (b - a) / n
-                size = (4 + width * 2) * ss
-                _head(d, p[mid] + u * size / 2, u, size, head_color)
+                c = tuple(int(v) for v in cols[i]) if colored and color is None else plain
+                _head(d, p[i] + u * size / 2, u, size, c)
 
 
-def compose(field, view, t, vref, background="none", arrows=None, lines=None, traces=(),
+def compose(field, grid, view, t, vref, background="none", arrows=None, lines=None, traces=(),
             colored=True, heads=True, ss=2, palette="studio"):
     """The static layer: background, axes, streamlines, arrows and traced lines, drawn at `ss`× and
     scaled down for antialiasing. `arrows` holds the draw_arrows settings, or None to skip them."""
     colored = colored and background == "none"   # on a heatmap, vectors are drawn in plain light color
-    img = heatmap(field, view, t, background, vref, palette).resize((view.w * ss, view.h * ss), Image.BILINEAR)
+    img = heatmap(grid, view, background, vref, palette, ss)
     d = ImageDraw.Draw(img)
     draw_axes(d, view, ss, grid=background == "none")
     if lines:
