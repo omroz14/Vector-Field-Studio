@@ -1,5 +1,10 @@
-"""Drawing: color maps, heatmaps, axes, arrows and streamlines into images the size of the stage."""
+"""Drawing: color maps, the style, heatmaps, guides, arrows and streamlines into images of a view.
+
+Two layers: the art (background, arrows, streamlines, traces and, on top, particles) is what an export shows;
+the guides (grid and axes) help on the stage and stay out of exports. Numbers are drawn by Tk only.
+"""
 import math
+from dataclasses import dataclass
 
 import numpy as np
 from PIL import Image, ImageDraw
@@ -7,6 +12,35 @@ from PIL import Image, ImageDraw
 from theme import *
 
 GRID = "#1b1f2a"   # faint grid lines on the plain background
+
+
+@dataclass(frozen=True)
+class Style:
+    """Every visual setting. Sizes are in points: one point is one stage pixel, and a render of the same
+    region at k× the pixels uses px_per_pt = k, so an export looks like the preview, only sharper.
+    Speeds and durations are per second, so the frame rate does not change the look either."""
+    px_per_pt: float = 1.0
+    palette: str = "studio"
+    background: str = "none"     # none, magnitude, divergence or curl
+    colored: bool = True         # vectors coloured by speed (on the plain background only)
+    arrow_spacing: float = 36.0
+    arrow_length: float = 1.0    # of the arrow cell
+    equal_length: bool = False
+    arrow_width: float = 1.5
+    stream_sep: float = 22.0
+    stream_heads: bool = True
+    line_width: float = 1.3
+    trace_width: float = 2.4
+    particle_size: float = 2.0   # side of a particle dot; never under 2 px, so trails survive 4:2:0 video
+    particle_speed: float = 90.0 # points per second at the typical speed |F| = vref (steady fields)
+    trail: float = 0.65          # seconds: time constant of the trail fade (0 = no trail)
+    substep: float = 1.2         # points between the dots that join a particle's old and new position
+    sample: float = 2.0          # points between the field samples of the grid
+    step: float = 1.5            # points per RK4 step of a streamline
+    tick: float = 90.0           # points between grid lines, roughly
+
+    def px(self, pt):
+        return pt * self.px_per_pt
 
 
 def _ramp(stops, pos):
@@ -60,7 +94,7 @@ def nice_step(raw):
     return next(m * mag for m in (1, 2, 5, 10) if m * mag >= raw * (1 - 1e-9))
 
 
-def ticks(view, target_px=90):
+def ticks(view, target_px=90.0):
     """(step, xs, ys): round world coordinates of the grid lines visible in the view."""
     step = nice_step(target_px / view.scale)
     x0, y1 = view.to_world(0, 0)
@@ -100,21 +134,23 @@ def heatmap(grid, view, kind, vref, palette="studio", ss=1):
     return _grid_to_view(Image.fromarray(img[::-1]), grid, view, ss)
 
 
-def draw_axes(d, view, ss, grid):
+def draw_guides(d, view, style, ss, grid):
+    """Axes, and with `grid` the faint grid lines. Display only."""
     w, h = view.w * ss, view.h * ss
-    _, xs, ys = ticks(view)
+    lw = max(1, round(style.px(1) * ss))
+    _, xs, ys = ticks(view, style.px(style.tick))
     if grid:
         for x in xs:
             px = view.to_px(x, 0)[0] * ss
-            d.line([(px, 0), (px, h)], fill=GRID, width=ss)
+            d.line([(px, 0), (px, h)], fill=GRID, width=lw)
         for y in ys:
             py = view.to_px(0, y)[1] * ss
-            d.line([(0, py), (w, py)], fill=GRID, width=ss)
+            d.line([(0, py), (w, py)], fill=GRID, width=lw)
     ox, oy = view.to_px(0, 0)
     if 0 <= ox <= view.w:
-        d.line([(ox * ss, 0), (ox * ss, h)], fill=BORDER, width=ss)
+        d.line([(ox * ss, 0), (ox * ss, h)], fill=BORDER, width=lw)
     if 0 <= oy <= view.h:
-        d.line([(0, oy * ss), (w, oy * ss)], fill=BORDER, width=ss)
+        d.line([(0, oy * ss), (w, oy * ss)], fill=BORDER, width=lw)
 
 
 def _head(d, tip, direction, size, color):
@@ -125,7 +161,8 @@ def _head(d, tip, direction, size, color):
     d.polygon([tuple(tip), (bx - uy * hw, by + ux * hw), (bx + uy * hw, by - ux * hw)], fill=color)
 
 
-def draw_arrows(d, field, view, t, vref, spacing, length, equal, colored, ss, palette="studio"):
+def draw_arrows(d, field, view, t, vref, style, colored, ss):
+    spacing, length, k = style.px(style.arrow_spacing), style.arrow_length, style.px_per_pt
     nx, ny = max(1, round(view.w / spacing)), max(1, round(view.h / spacing))
     X, Y = view.grid(nx, ny)
     U, V = field(X, Y, t)
@@ -133,17 +170,17 @@ def draw_arrows(d, field, view, t, vref, spacing, length, equal, colored, ss, pa
     m = np.hypot(U, V)
     cell = min(view.w / nx, view.h / ny)
     rel = m / vref
-    if equal:
+    if style.equal_length:
         L = np.where(rel > 1e-6, 0.8 * cell * length, 0.0)
     else:
         L = 0.9 * cell * length * np.clip(rel, 0, 1.5)
     with np.errstate(all="ignore"):
         ux, uy = np.nan_to_num(U / m), np.nan_to_num(-V / m)
     px, py = view.to_px(X.ravel(), Y.ravel())
-    colors = vector_colors(rel, colored, palette)
-    width = max(1, round(1.5 * ss))
-    for i in np.flatnonzero(L > 2):
-        hl = min(max(0.35 * L[i], 3.0), 8.0)
+    colors = vector_colors(rel, colored, style.palette)
+    width = max(1, round(style.px(style.arrow_width) * ss))
+    for i in np.flatnonzero(L > 2 * k):
+        hl = min(max(0.35 * L[i], 3.0 * k), 8.0 * k)
         dx, dy = ux[i], uy[i]
         tip = np.array([px[i] + 0.5 * L[i] * dx, py[i] + 0.5 * L[i] * dy])
         tail = (px[i] - 0.5 * L[i] * dx, py[i] - 0.5 * L[i] * dy)
@@ -153,11 +190,12 @@ def draw_arrows(d, field, view, t, vref, spacing, length, equal, colored, ss, pa
         _head(d, tip * ss, (dx, dy), hl * ss, c)
 
 
-def draw_lines(d, lines, vref, colored, heads, ss, width=1.3, color=None, palette="studio"):
-    """Streamlines from field.streamlines(). With `color`, every line gets that color."""
+def draw_lines(d, lines, vref, colored, heads, ss, width, k=1.0, color=None, palette="studio"):
+    """Streamlines from field.streamlines(), `width` px wide (px_per_pt k sizes the arrows).
+    With `color`, every line gets that color."""
     w = max(1, round(width * ss))
     plain = color or hex_to_rgb(TEXT)
-    size = (4 + width * 2) * ss
+    size = (4 * k + width * 2) * ss
     for pts, speed, arrows in lines:
         if len(pts) < 2:
             continue
@@ -180,20 +218,29 @@ def draw_lines(d, lines, vref, colored, heads, ss, width=1.3, color=None, palett
                 _head(d, p[i] + u * size / 2, u, size, c)
 
 
-def compose(field, grid, view, t, vref, background="none", arrows=None, lines=None, traces=(),
-            colored=True, heads=True, ss=2, palette="studio"):
-    """The static layer: background, axes, streamlines, arrows and traced lines, drawn at `ss`× and
-    scaled down for antialiasing. `arrows` holds the draw_arrows settings, or None to skip them."""
-    colored = colored and background == "none"   # on a heatmap, vectors are drawn in plain light color
-    img = heatmap(grid, view, background, vref, palette, ss)
+def compose(field, grid, view, t, vref, style, arrows=False, lines=None, traces=(), ss=2, guides=True):
+    """The static layer: background, guides (if `guides`), streamlines, arrows (if `arrows`) and traced lines,
+    drawn at `ss`× and scaled down for antialiasing."""
+    colored = style.colored and style.background == "none"   # on a heatmap, vectors are drawn in light color
+    k = style.px_per_pt
+    img = heatmap(grid, view, style.background, vref, style.palette, ss)
     d = ImageDraw.Draw(img)
-    draw_axes(d, view, ss, grid=background == "none")
+    if guides:
+        draw_guides(d, view, style, ss, grid=style.background == "none")
     if lines:
-        draw_lines(d, lines, vref, colored, heads, ss, palette=palette)
+        draw_lines(d, lines, vref, colored, style.stream_heads, ss, style.px(style.line_width), k,
+                   palette=style.palette)
     if arrows:
-        draw_arrows(d, field, view, t, vref, colored=colored, ss=ss, palette=palette, **arrows)
+        draw_arrows(d, field, view, t, vref, style, colored, ss)
     if traces:
-        draw_lines(d, traces, vref, False, True, ss, width=2.4, color=(255, 255, 255))
+        draw_lines(d, traces, vref, False, True, ss, style.px(style.trace_width), k, color=(255, 255, 255))
     if ss > 1:
         img = img.resize((view.w, view.h), Image.LANCZOS)
     return np.asarray(img)
+
+
+def screen(a, b):
+    """Screen blend of two uint8 images, 1 − (1 − a)(1 − b): light adds up without clipping to the brighter one."""
+    a = a.astype(np.uint16)
+    b = b.astype(np.uint16)
+    return (a + b - (a * b + 127) // 255).astype(np.uint8)

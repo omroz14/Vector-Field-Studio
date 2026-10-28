@@ -90,8 +90,8 @@ def _occ_pop(occ, cell, k0):
 
 @_jit
 def _occ_near(occ, cell, x, y, r, line, s, s_skip, others):
-    """True if a stored point lies closer than r (<= cell) to (x, y). Points of `line` within arc s_skip of s
-    are its own neighbours and do not count; points of other lines count only if `others`."""
+    """The index of a stored point closer than r (<= cell) to (x, y), or -1. Points of `line` within arc s_skip
+    of s are its own neighbours and do not count; points of other lines count only if `others`."""
     head, nxt, px, py, pl, ps, cnt = occ
     cx, cy = int(x / cell), int(y / cell)
     r2 = r * r
@@ -103,11 +103,11 @@ def _occ_near(occ, cell, x, y, r, line, s, s_skip, others):
                 if dx * dx + dy * dy < r2:
                     if pl[k] == line:
                         if abs(ps[k] - s) >= s_skip:
-                            return True
+                            return k
                     elif others:
-                        return True
+                        return k
                 k = nxt[k]
-    return False
+    return -1
 
 
 # ---------- tracing ----------
@@ -132,7 +132,14 @@ def _half(U, V, occ, cell, gx, gy, sign, ds, tiny, d_test, s_skip, others, max_s
             break
         turn += abs(math.atan2(k1x * nky - k1y * nkx, dot))
         s = sign * (n + 1) * ds
-        if turn > max_turn or _occ_near(occ, cell, qx, qy, d_test, line, s, s_skip, others):
+        if turn > max_turn:
+            break
+        hit = _occ_near(occ, cell, qx, qy, d_test, line, s, s_skip, others)
+        if hit >= 0:
+            # Back at its own seed: a closed orbit. End exactly on the seed instead of a gap short of it.
+            if occ[4][hit] == line and abs(occ[5][hit]) < d_test and n < max_steps:
+                bx[n], by[n], bm[n] = occ[2][hit], occ[3][hit], m
+                n += 1
             break
         if not _occ_add(occ, cell, qx, qy, line, s):
             break
@@ -211,7 +218,7 @@ def _evenly_spaced(U, V, occ, d_sep, ds, tiny, min_len, max_steps, lat_k, lat_ox
                     cx = lx[p] - side * d_sep * v / m
                     cy = ly[p] + side * d_sep * u / m
                     if (0.0 <= cx <= nx - 1 and 0.0 <= cy <= ny - 1
-                            and not _occ_near(occ, d_sep, cx, cy, d_sep, -1, 0.0, 0.0, True)):
+                            and _occ_near(occ, d_sep, cx, cy, d_sep, -1, 0.0, 0.0, True) < 0):
                         nout, nl = _grow(U, V, occ, d_sep, cx, cy, ds, tiny, d_test, s_skip, True, max_steps,
                                          max_turn, min_len, fx, fy, fm, bx, by, bm, lx, ly, lm, starts, seed_at,
                                          nout, nl)
@@ -219,7 +226,7 @@ def _evenly_spaced(U, V, occ, d_sep, ds, tiny, min_len, max_steps, lat_k, lat_ox
         elif li < order.size:
             k = order[li]
             li += 1
-            if not _occ_near(occ, d_sep, sx[k], sy[k], d_sep, -1, 0.0, 0.0, True):
+            if _occ_near(occ, d_sep, sx[k], sy[k], d_sep, -1, 0.0, 0.0, True) < 0:
                 nout, nl = _grow(U, V, occ, d_sep, sx[k], sy[k], ds, tiny, d_test, s_skip, True, max_steps,
                                  max_turn, min_len, fx, fy, fm, bx, by, bm, lx, ly, lm, starts, seed_at, nout, nl)
         else:

@@ -1,6 +1,7 @@
 """Application window: field equations, display settings, the stage and the particle animation."""
 import math
 import os
+import time
 import tkinter as tk
 import traceback
 from tkinter import filedialog
@@ -10,11 +11,12 @@ import numpy as np
 from PIL import Image, ImageTk
 
 import field as fieldmod
+import particles
 import render
 import worker
 from theme import *
 
-TICK_MS = 33       # ~30 frames per second
+FPS = 30           # frames per second of the animation (and of the GIF)
 PANEL_W = 290      # width of each side panel (px)
 QUICK_MS = 220     # quiet time after an interaction before the full-quality redraw
 POLL_MS = 8        # how often the Tk thread looks for finished renders
@@ -64,6 +66,15 @@ def _slider_from(half):
     return float(np.clip(40 * math.log10(half / HALF_MIN), 0, 100))
 
 
+def _rate_from(v):
+    """Time-rate slider (0..100, logarithmic) -> units of t per second, 0.05 to 5."""
+    return 0.05 * 10 ** (v / 50)
+
+
+def _rate_slider(rate):
+    return float(np.clip(50 * math.log10(rate / 0.05), 0, 100))
+
+
 def _short(expr, n=34):
     return expr if len(expr) <= n else expr[:n - 1] + "…"
 
@@ -97,12 +108,12 @@ class App(ctk.CTk):
         self.stream_sep = 22
         self.stream_heads = tk.BooleanVar(value=True)
         self.n_particles = 2000
-        self.p_speed = 3                # px per frame at the typical speed
-        self.trail_len = 20             # frames
+        self.p_speed = 3                # × 30 points per second at the typical speed (steady fields)
+        self.trail_s = 0.65             # seconds: how long trails take to fade
+        self.t_rate = 0.5               # units of t per second (fields that use t)
         self.pins = []                  # world points with a traced streamline
 
-        self.parts = fieldmod.Particles()
-        self.trail = None               # particle trails, float32 (h, w, 3)
+        self.flow = None                # particles and their trails (particles.Flow)
         self._worker = worker.Worker()  # builds static layers off the Tk thread
         self._gen = 0                   # number of the newest static layer asked for
         self._static = None             # newest finished Static: background + vectors, maybe for an older view
@@ -113,6 +124,7 @@ class App(ctk.CTk):
         self._photo = None
         self.running = False
         self._after_id = None
+        self._deadline = 0.0            # when the next animation frame is due (perf_counter seconds)
         self._redraw_id = None
         self._full_id = None
         self._press = None
@@ -232,9 +244,9 @@ class App(ctk.CTk):
         c = card(right, "PARTICLES", "Space")
         self.row_count = SliderRow(c, "Count", 100, 6000, self.n_particles, self._on_count)
         self.row_speed = SliderRow(c, "Speed", 1, 12, self.p_speed, self._on_speed, fmt=lambda v: f"{v}×")
-        self.row_trail = SliderRow(c, "Trail", 1, 60, self.trail_len, self._on_trail,
-                                   fmt=lambda v: "none" if v <= 1 else f"{v} frames")
-        ctk.CTkFrame(c, fg_color="transparent", height=PAD - 4).pack()
+        self.row_trail = SliderRow(c, "Trail", 0, 300, round(self.trail_s * 100), self._on_trail,
+                                   fmt=lambda v: "none" if v == 0 else f"{v / 100:.2f} s")
+        note(c, "For a field that uses t, the time rate under the stage sets the speed.", pady=(4, PAD))
 
         # PROBE
         c = card(right, "PROBE", "hover the stage")
@@ -281,7 +293,11 @@ class App(ctk.CTk):
         self.lbl_t.grid(row=0, column=1, sticky="ew", padx=(0, PAD), pady=(PAD - 2, 0))
         self.lbl_status = ctk.CTkLabel(bar, text="", font=FONT_SMALL, text_color=MUTED, anchor="w", height=18)
         self.lbl_status.grid(row=1, column=1, sticky="ew", padx=(0, PAD), pady=(2, PAD - 4))
-        button(bar, "↺  Reset time", self.reset_time, width=120).grid(row=0, column=2, rowspan=2, padx=(0, PAD))
+        rate = ctk.CTkFrame(bar, fg_color="transparent", width=230)
+        rate.grid(row=0, column=2, rowspan=2, sticky="ew", padx=(0, 4))
+        self.row_rate = SliderRow(rate, "Time rate", 0, 100, round(_rate_slider(self.t_rate)), self._on_rate,
+                                  fmt=lambda v: f"{_rate_from(v):.2g} t/s")
+        button(bar, "↺  Reset time", self.reset_time, width=120).grid(row=0, column=3, rowspan=2, padx=(0, PAD))
 
     def _bind_stage(self):
         s = self.stage
@@ -336,9 +352,11 @@ class App(ctk.CTk):
         self.preset = next((p[0] for p in fieldmod.PRESETS
                             if (p[2], p[3]) == (f.fx, f.fy)), None)
         self.preset_grid.select(self.preset)
-        self.trail = None
+        self.flow = None
+        self.row_rate.enable(f.uses_t)
+        self.row_speed.enable(not f.uses_t)
         self._invalidate()
-        self._status("Field applied." + (" It depends on t: press Space to let time run." if f.uses_t else ""))
+        self._status("Field applied." + (" It uses t: Space runs time." if f.uses_t else ""))
 
     def set_mode(self, mode):
         self.mode = mode
@@ -360,8 +378,8 @@ class App(ctk.CTk):
         self.palette = key
         self.palette_grid.select(key)
         self._draw_colorbar()
-        if self.trail is not None:
-            self.trail[:] = 0             # old trails keep the colors of the previous palette
+        if self.flow is not None:
+            self.flow.clear()             # old trails keep the colors of the previous palette
         self._invalidate()
 
     def _cycle_palette(self):
@@ -408,14 +426,25 @@ class App(ctk.CTk):
 
     def _on_count(self, v):
         self.n_particles = v
-        self.trail = None
+        self.flow = None
         self._invalidate(static=False)
 
     def _on_speed(self, v):
         self.p_speed = v
 
     def _on_trail(self, v):
-        self.trail_len = v
+        self.trail_s = v / 100
+
+    def _on_rate(self, v):
+        self.t_rate = _rate_from(v)
+
+    def _style(self, px_per_pt=1.0):
+        """The current look as a render.Style, for a render at px_per_pt pixels per stage pixel."""
+        return render.Style(
+            px_per_pt=px_per_pt, palette=self.palette, background=self.bg_kind, colored=self.colored.get(),
+            arrow_spacing=self.arrow_spacing, arrow_length=self.arrow_len / 100,
+            equal_length=self.equal_len.get(), stream_sep=self.stream_sep, stream_heads=self.stream_heads.get(),
+            particle_speed=30.0 * self.p_speed, trail=self.trail_s)
 
     # ---------- view: pan, zoom, traces, probe ----------
 
@@ -428,8 +457,8 @@ class App(ctk.CTk):
 
     def _view_changed(self):
         self._invalidate(quick=True)
-        if self.trail is not None:
-            self.trail[:] = 0             # trails are in screen space; particles stay in the world
+        if self.flow is not None:
+            self.flow.clear()             # trails are in screen space; particles stay in the world
 
     def reset_view(self):
         self.center, self.half = self.home
@@ -521,28 +550,27 @@ class App(ctk.CTk):
         if not self.running and self.field is not None:   # while playing, every tick redraws
             self._show(self._view())
 
-    def _static_job(self, view, quick):
-        """A snapshot of everything the static layer depends on, as a job for the render thread."""
-        gen, field, t, mode, bg = self._gen, self.field, self.t, self.mode, self.bg_kind
-        pins, sep, palette = list(self.pins), self.stream_sep, self.palette
-        colored, heads = self.colored.get(), self.stream_heads.get()
-        arrows = None
-        if mode == ARROWS or self.overlay.get():
-            arrows = dict(spacing=self.arrow_spacing, length=self.arrow_len / 100, equal=self.equal_len.get())
+    def _static_job(self, view, quick, guides=True):
+        """A snapshot of everything the static layer depends on, as a job for the render thread.
+        Without `guides` it is the art alone, as exports show it."""
+        gen, field, t, mode, style, pins = self._gen, self.field, self.t, self.mode, self._style(), list(self.pins)
+        arrows = mode == ARROWS or self.overlay.get()
 
         def build():
             try:
                 vref = fieldmod.reference_speed(field, view, t)
                 grid = None
-                if mode != ARROWS or bg != "none" or pins:
-                    grid = fieldmod.FieldGrid(field, view, t)
-                lines = fieldmod.streamlines(grid, view, vref, sep) if mode == STREAMLINES else None
+                if mode != ARROWS or style.background != "none" or pins:
+                    grid = fieldmod.FieldGrid(field, view, t, spacing=style.px(style.sample))
+                lines = None
+                if mode == STREAMLINES:
+                    lines = fieldmod.streamlines(grid, view, vref, style.px(style.stream_sep), style.px(style.step))
                 traces = ()
                 if pins:
                     pts = np.array([view.to_px(x, y) for x, y in pins])
-                    traces = fieldmod.trace_through(grid, view, vref, pts)
-                img = render.compose(field, grid, view, t, vref, bg, arrows, lines, traces, colored=colored,
-                                     heads=heads, palette=palette, ss=1 if quick else 2)
+                    traces = fieldmod.trace_through(grid, view, vref, pts, style.px(1.0))
+                img = render.compose(field, grid, view, t, vref, style, arrows, lines, traces,
+                                     ss=1 if quick else 2, guides=guides)
                 return Static(gen, view, img, grid)
             except ValueError as exc:
                 return Static(gen, view, error=f"Could not evaluate the field: {exc}")
@@ -559,11 +587,6 @@ class App(ctk.CTk):
         self._worker.submit(self._static_job(self._view(), quick))
         if self._poll_id is None:
             self._poll_id = self.after(POLL_MS, self._poll)
-
-    def _build_now(self, view, quick=False):
-        """Builds the static layer on this thread (for exports, which must not use a stale one)."""
-        self._gen += 1
-        self._accept(self._static_job(view, quick)())
 
     def _poll(self):
         self._poll_id = None
@@ -617,14 +640,15 @@ class App(ctk.CTk):
         self._fitted = (st, key, img)
         return img
 
-    def _compose(self, view):
-        """The frame to show: the static layer, plus particle trails in the Particles view."""
-        static = self._fit_static(view)
+    def _compose(self, view, static=None):
+        """The frame to show: the static layer (the newest one, unless given), plus the particle trails
+        screen-blended on top in the Particles view."""
+        if static is None:
+            static = self._fit_static(view)
         if self.mode != PARTICLES:
             return static
-        if self.trail is None or self.trail.shape[:2] != (view.h, view.w):
-            self._reset_particles(view)
-        return np.maximum(static, self.trail.astype(np.uint8))
+        self._ensure_flow(view)
+        return render.screen(static, self.flow.image())
 
     def _show(self, view):
         self._frame = self._compose(view)
@@ -659,47 +683,25 @@ class App(ctk.CTk):
 
     # ---------- particles and time ----------
 
-    def _reset_particles(self, view):
-        self.parts.reset(self.n_particles, view)
-        self.trail = np.zeros((view.h, view.w, 3), np.float32)
-        x, y = self.parts.pos.T
-        u, v = self.field(x, y, self.t)
+    def _ensure_flow(self, view):
+        """Particles for `view`: new ones if there are none or the stage changed size."""
+        if self.flow is not None and (self.flow.view.w, self.flow.view.h) == (view.w, view.h):
+            self.flow.view = view
+            return
+        self.flow = particles.Flow(self.n_particles, view, FPS)
+        self.flow.paint(self.field, self.t, fieldmod.reference_speed(self.field, view, self.t), self._style())
+
+    def _step(self, view, static=None):
+        """Advances time by one frame, and the particles with it in the Particles view. They move through the
+        grid of `static`, by default the newest static layer."""
+        style = self._style()
         vref = fieldmod.reference_speed(self.field, view, self.t)
-        px, py = view.to_px(x, y)
-        self._dot(px.astype(int), py.astype(int), self._particle_colors(np.hypot(u, v) / vref))
-
-    def _particle_colors(self, rel):
-        return render.vector_colors(rel, self.colored.get() and self.bg_kind == "none",
-                                    self.palette).astype(np.float32)
-
-    def _dot(self, px, py, col):
-        """Paints 2×2 dots into the trail buffer."""
-        h, w = self.trail.shape[:2]
-        ok = (px >= 0) & (px < w - 1) & (py >= 0) & (py < h - 1)
-        px, py, col = px[ok], py[ok], col[ok]
-        for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
-            self.trail[py + dy, px + dx] = np.maximum(self.trail[py + dy, px + dx], col)
-
-    def _step(self, view):
-        """Advances time by one frame, and the particles with it in the Particles view."""
-        vref = fieldmod.reference_speed(self.field, view, self.t)
-        dt = self.p_speed / (vref * view.scale)    # a particle at the typical speed moves p_speed px
-        grid = self._static.grid if self._static is not None else None
+        dt = particles.frame_dt(self.field, view, style, vref, FPS, self.t_rate)
+        static = static or self._static
+        grid = static.grid if static is not None else None
         if self.mode == PARTICLES and grid is not None:   # no grid yet: the first render is still running
-            if self.trail is None or self.trail.shape[:2] != (view.h, view.w):
-                self._reset_particles(view)
-            self.trail *= 1 - 1 / self.trail_len
-            old, speed, dead = self.parts.step(grid, view, dt)
-            keep = ~dead
-            ox, oy = view.to_px(*old[keep].T)
-            nx, ny = view.to_px(*self.parts.pos[keep].T)
-            col = self._particle_colors(speed[keep] / vref)
-            # Fill the gap between the old and new position, so fast particles leave lines, not dots.
-            dist = np.hypot(nx - ox, ny - oy)
-            nsub = int(np.clip(np.ceil(dist.max(initial=0) / 1.2), 1, 12))
-            for k in range(1, nsub + 1):
-                a = k / nsub
-                self._dot((ox + a * (nx - ox)).astype(int), (oy + a * (ny - oy)).astype(int), col)
+            self._ensure_flow(view)
+            self.flow.step(grid, dt, vref, style)
         self.t += dt
 
     def toggle_play(self):
@@ -714,6 +716,7 @@ class App(ctk.CTk):
         self.running = True
         self.btn_play.configure(text="❚❚  Pause")
         self._status("Playing. Particles follow the field; their colour shows the speed.")
+        self._deadline = time.perf_counter()
         self._tick()
 
     def _stop(self):
@@ -733,15 +736,25 @@ class App(ctk.CTk):
             self._request(quick=True)     # shown by a later tick; until then the last one stays up
         self._show(view)
         self.lbl_t.configure(text=f"t = {self.t:.2f}")
-        self._after_id = self.after(TICK_MS, self._tick)
+        # Frames are due every 1/FPS s whatever the work took; after a stall the lost frames are dropped.
+        now = time.perf_counter()
+        self._deadline = max(self._deadline + 1 / FPS, now)
+        self._after_id = self.after(max(1, round((self._deadline - now) * 1000)), self._tick)
 
     def reset_time(self):
         self.t = 0.0
-        self.trail = None
+        self.flow = None
         self.lbl_t.configure(text="t = 0.00")
         self._invalidate()
 
     # ---------- files ----------
+
+    def _art(self, view, quick=False):
+        """The static layer without guides, built on this thread: exports must not use a stale one."""
+        st = self._static_job(view, quick, guides=False)()
+        if st.error:
+            raise ValueError(st.error)
+        return st
 
     def save_png(self):
         if self._frame is None:
@@ -750,7 +763,13 @@ class App(ctk.CTk):
                                             initialfile="vector_field.png", filetypes=[("PNG", "*.png")])
         if not path:
             return
-        Image.fromarray(self._frame).save(path)
+        view = self._view()
+        try:
+            art = self._art(view)
+        except ValueError as exc:
+            self._status(str(exc))
+            return
+        Image.fromarray(self._compose(view, art.img)).save(path)
         self._status(f"Saved: {os.path.basename(path)}")
 
     def save_gif(self):
@@ -764,13 +783,17 @@ class App(ctk.CTk):
         if self.mode != PARTICLES and not self.field.uses_t:
             self.set_mode(PARTICLES)
         view = self._view()
-        self._build_now(view)
+        try:
+            art = self._art(view)
+        except ValueError as exc:
+            self._status(str(exc))
+            return
         frames = []
         for i in range(GIF_FRAMES):
-            self._step(view)
+            self._step(view, art)
             if self.field.uses_t:
-                self._build_now(view, quick=True)
-            img = Image.fromarray(self._compose(view))
+                art = self._art(view, quick=True)
+            img = Image.fromarray(self._compose(view, art.img))
             img.thumbnail((GIF_MAX, GIF_MAX), Image.LANCZOS)
             frames.append(img)
             if i % 10 == 0:
@@ -779,7 +802,7 @@ class App(ctk.CTk):
         # One shared palette and no dithering keep the file small: noisy dithered trails compress badly.
         pal = frames[-1].quantize(colors=64, dither=Image.Dither.NONE)
         frames = [f.quantize(palette=pal, dither=Image.Dither.NONE) for f in frames]
-        frames[0].save(path, save_all=True, append_images=frames[1:], duration=TICK_MS, loop=0)
+        frames[0].save(path, save_all=True, append_images=frames[1:], duration=round(1000 / FPS), loop=0)
         self.lbl_t.configure(text=f"t = {self.t:.2f}")
         self._invalidate()
         self._status(f"Saved animation: {os.path.basename(path)}")

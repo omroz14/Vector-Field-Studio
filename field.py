@@ -1,4 +1,4 @@
-"""Vector fields: presets, safe expression parsing, the view transform, the sampled grid, streamlines and particles."""
+"""Vector fields: presets, safe expression parsing, the view transform, the sampled grid and streamlines."""
 import ast
 import math
 
@@ -140,6 +140,7 @@ class FieldGrid:
     The lattice is anchored in the world: panning by whole nodes gives the very same samples."""
 
     def __init__(self, field, view, t=0.0, spacing=2.0, overscan=0.25):
+        self.spacing = spacing   # px of `view` between nodes
         self.h = h = spacing / view.scale
         self.view, self.t = view, t
         mx, my = overscan * view.w, overscan * view.h
@@ -169,7 +170,8 @@ def _lines_px(grid, view, x, y, m, starts, step, gap):
     so they scatter evenly instead of lining up across neighbouring lines."""
     px, py = grid.to_px(x, y, view)
     pts = np.stack([px, py], axis=1)
-    inside = (px > -8) & (px < view.w + 8) & (py > -8) & (py < view.h + 8)
+    mg = 4 * step
+    inside = (px > -mg) & (px < view.w + mg) & (py > -mg) & (py < view.h + mg)
     every = max(2, round(gap / step))   # the points of a line are `step` px apart
     lines = []
     for n, (a, b) in enumerate(zip(starts[:-1], starts[1:])):
@@ -189,7 +191,7 @@ def _lines_px(grid, view, x, y, m, starts, step, gap):
 def streamlines(grid, view, vref, sep, step=1.5):
     """Evenly spaced streamlines over the grid, `sep` px apart, traced in RK4 steps of `step` px.
     Returns [(points (N, 2) px, speeds (N,), arrow indices)]; lines run in the field direction."""
-    unit = grid.h * view.scale   # px per grid unit
+    unit = grid.spacing   # px per grid unit; sep / unit is the same at any px_per_pt
     d_sep = sep / unit
     k = max(1, round(d_sep))
     lattice = (k, (-grid.i0) % k, (-grid.j0) % k)
@@ -201,44 +203,7 @@ def trace_through(grid, view, vref, points_px, step=1.0):
     """Full streamlines through the given pixel points, in the format of streamlines()."""
     pts = np.asarray(points_px, float).reshape(-1, 2)
     gx, gy = grid.to_grid(pts[:, 0], pts[:, 1], view)
-    unit = grid.h * view.scale
-    x, y, m, starts, _ = kernels.trace_through(grid.U, grid.V, gx, gy, step / unit, 1e-6 * vref, d_self=2.0 / unit)
-    return _lines_px(grid, view, x, y, m, starts, step, 240)
-
-
-class Particles:
-    """Massless tracers carried by the field. Positions are in world coordinates."""
-
-    def __init__(self):
-        self.rng = np.random.default_rng()
-        self.pos = None
-
-    def _spawn(self, n, view):
-        px = self.rng.uniform(0, view.w, n)
-        py = self.rng.uniform(0, view.h, n)
-        return np.stack(view.to_world(px, py), axis=1)
-
-    def reset(self, n, view):
-        self.pos = self._spawn(n, view)
-        self.life = self.rng.uniform(40, 140, n)
-        self.age = self.rng.uniform(0, self.life)
-
-    def step(self, grid, view, dt):
-        """Moves every particle by one RK4 step through the grid and respawns the ones that left the view
-        or grew old. Returns (previous positions, speeds, respawned mask)."""
-        old = self.pos.copy()
-        x, y = old[:, 0].copy(), old[:, 1].copy()
-        speed = np.empty(len(x))
-        alive = np.empty(len(x), bool)
-        kernels.advect(grid.U, grid.V, grid.x0, grid.y0, grid.h, x, y, dt, speed, alive)
-        self.pos = np.stack([x, y], axis=1)
-        self.age += 1
-        px, py = view.to_px(x, y)
-        dead = ((self.age > self.life) | ~alive | ~np.isfinite(px) | ~np.isfinite(py)
-                | (px < 0) | (px >= view.w) | (py < 0) | (py >= view.h))
-        n = int(dead.sum())
-        if n:
-            self.pos[dead] = self._spawn(n, view)
-            self.age[dead] = 0
-            self.life[dead] = self.rng.uniform(40, 140, n)
-        return old, speed, dead
+    unit = grid.spacing
+    x, y, m, starts, _ = kernels.trace_through(grid.U, grid.V, gx, gy, step / unit, 1e-6 * vref,
+                                               d_self=2 * step / unit)
+    return _lines_px(grid, view, x, y, m, starts, step, 240 * step)
