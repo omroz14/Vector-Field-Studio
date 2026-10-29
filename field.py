@@ -177,18 +177,38 @@ class Field:
         return out[0], out[1]
 
 
-class View:
-    """Maps world coordinates to stage pixels. y grows upward in the world and downward on screen."""
+def _whole(v):
+    """v, or the whole number it is up to float noise."""
+    r = round(v)
+    return float(r) if abs(v - r) < 1e-6 else v
 
-    def __init__(self, cx, cy, half_h, w, h):
+
+class View:
+    """Maps world coordinates to stage pixels. y grows upward in the world and downward on screen.
+
+    At a given zoom the world is tiled by a lattice of pixels: x·scale and −y·scale are lattice coordinates,
+    and the view starts at origin(). A view whose origin is a whole lattice pixel (see viewport.snap) maps
+    lattice-anchored points to the same pixels, to the last bit, as any other such view."""
+
+    def __init__(self, cx, cy, half_h, w, h, scale=None):
         self.cx, self.cy, self.w, self.h = cx, cy, w, h
-        self.scale = h / (2 * half_h)   # pixels per world unit
+        self.scale = scale or h / (2 * half_h)   # pixels per world unit
+        self.ox, self.oy = _whole(cx * self.scale - w / 2), _whole(-cy * self.scale - h / 2)
+
+    @classmethod
+    def at(cls, cx, cy, scale, w, h):
+        """A view at exactly this scale (a half-height would round it)."""
+        return cls(cx, cy, None, w, h, scale)
+
+    def origin(self):
+        """The lattice coordinates of the view's top-left corner."""
+        return self.ox, self.oy
 
     def to_px(self, x, y):
-        return self.w / 2 + (x - self.cx) * self.scale, self.h / 2 - (y - self.cy) * self.scale
+        return x * self.scale - self.ox, -y * self.scale - self.oy
 
     def to_world(self, px, py):
-        return self.cx + (px - self.w / 2) / self.scale, self.cy - (py - self.h / 2) / self.scale
+        return (px + self.ox) / self.scale, -(py + self.oy) / self.scale
 
     def grid(self, nx, ny):
         """World coordinates of the centers of an nx × ny grid of cells covering the stage (row 0 on top)."""
@@ -227,9 +247,15 @@ class FieldGrid:
         U, V = field(X, Y, t)
         self.U, self.V = U.astype(np.float32), V.astype(np.float32)
 
+    def unit(self, view):
+        """Pixels of `view` per grid unit (exactly `spacing` at the grid's own zoom)."""
+        s = self.h * view.scale
+        return self.spacing if abs(s - self.spacing) < 1e-9 * s else s
+
     def to_px(self, gx, gy, view):
-        """Grid positions -> pixels of `view`."""
-        return view.to_px(self.x0 + gx * self.h, self.y0 + gy * self.h)
+        """Grid positions -> pixels of `view`. Node (i, j) sits at lattice pixel ((i0 + i)·s, −(j0 + j)·s)."""
+        s = self.unit(view)
+        return (self.i0 + gx) * s - view.ox, -(self.j0 + gy) * s - view.oy
 
     def to_grid(self, px, py, view):
         x, y = view.to_world(px, py)
@@ -237,13 +263,13 @@ class FieldGrid:
 
 
 def _lines_px(grid, view, x, y, m, starts, step, gap):
-    """Kernel output -> the parts of the lines that lie in the view, as
-    [(points (N, 2) px, speeds (N,), indices of the points that get a direction arrow)].
+    """Kernel output -> the parts of the lines that lie in the view, as [(points (N, 2) px, speeds (N,),
+    indices of the points that get a direction arrow, index of the first point in its whole line)].
     Arrows are `gap` px apart along every line, each line starting at its own (golden-ratio) phase,
     so they scatter evenly instead of lining up across neighbouring lines."""
     px, py = grid.to_px(x, y, view)
     pts = np.stack([px, py], axis=1)
-    mg = 4 * step
+    mg = 6 * step   # beyond what downscaling and the drawing margin of render.compose can reach
     inside = (px > -mg) & (px < view.w + mg) & (py > -mg) & (py < view.h + mg)
     every = max(2, round(gap / step))   # the points of a line are `step` px apart
     lines = []
@@ -254,29 +280,43 @@ def _lines_px(grid, view, x, y, m, starts, step, gap):
         heads = np.arange(int((n * 0.6180339887) % 1 * every), b - a, every)
         runs = np.flatnonzero(np.diff(np.concatenate([[0], vis.view(np.int8), [0]])))
         for r0, r1 in runs.reshape(-1, 2):
-            r0, r1 = max(r0 - 1, 0), min(r1 + 1, b - a)   # one point past each end reaches the edge
+            # Past each end to a whole piece of 8 points (render.draw_lines colours by pieces), so a line
+            # cut by a neighbouring view is drawn the same where both show it.
+            r0, r1 = max((r0 - 1) // 8 * 8, 0), min((r1 + 8) // 8 * 8 + 1, b - a)
             if r1 - r0 >= 2:
                 h = heads[(heads >= r0 + 3) & (heads < r1 - 3)] - r0
-                lines.append((pts[a + r0:a + r1], m[a + r0:a + r1], h))
+                lines.append((pts[a + r0:a + r1], m[a + r0:a + r1], h, r0))
     return lines
 
 
-def streamlines(grid, view, vref, sep, step=1.5):
-    """Evenly spaced streamlines over the grid, `sep` px apart, traced in RK4 steps of `step` px.
-    Returns [(points (N, 2) px, speeds (N,), arrow indices)]; lines run in the field direction."""
+def layout_streamlines(grid, vref, sep, step=1.5):
+    """Evenly spaced streamlines over the whole grid, `sep` px apart (px of the grid's view), traced in RK4
+    steps of `step` px. Returns the kernel output (grid units), which lines_in() turns into pixels."""
     unit = grid.spacing   # px per grid unit; sep / unit is the same at any px_per_pt
     d_sep = sep / unit
     k = max(1, round(d_sep))
     lattice = (k, (-grid.i0) % k, (-grid.j0) % k)
     x, y, m, starts, _ = kernels.evenly_spaced(grid.U, grid.V, d_sep, step / unit, 1e-6 * vref, lattice)
-    return _lines_px(grid, view, x, y, m, starts, step, 12 * sep)
+    return x, y, m, starts
 
 
-def trace_through(grid, view, vref, points_px, step=1.0):
-    """Full streamlines through the given pixel points, in the format of streamlines()."""
-    pts = np.asarray(points_px, float).reshape(-1, 2)
-    gx, gy = grid.to_grid(pts[:, 0], pts[:, 1], view)
-    unit = grid.spacing
+def lines_in(grid, view, layout, step, sep):
+    """The parts of a layout_streamlines() layout that `view` shows, in its pixels; step and sep in its px."""
+    return _lines_px(grid, view, *layout, step, 12 * sep)
+
+
+def streamlines(grid, view, vref, sep, step=1.5):
+    """Evenly spaced streamlines over the grid, `sep` px apart, traced in RK4 steps of `step` px.
+    Returns [(points (N, 2) px, speeds (N,), arrow indices)]; lines run in the field direction."""
+    return lines_in(grid, view, layout_streamlines(grid, vref, sep, step), step, sep)
+
+
+def trace_through(grid, view, vref, points, step=1.0):
+    """Full streamlines through the given world points, in the format of streamlines() (pixels of `view`;
+    `step` in them). Seeded in grid units straight from the world, so every view traces the same lines."""
+    pts = np.asarray(points, float).reshape(-1, 2)
+    gx, gy = (pts[:, 0] - grid.x0) / grid.h, (pts[:, 1] - grid.y0) / grid.h
+    unit = grid.unit(view)
     x, y, m, starts, _ = kernels.trace_through(grid.U, grid.V, gx, gy, step / unit, 1e-6 * vref,
                                                d_self=2 * step / unit)
     return _lines_px(grid, view, x, y, m, starts, step, 240 * step)

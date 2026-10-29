@@ -111,24 +111,33 @@ def ticks(view, target_px=90.0):
 def view_affine(old, new):
     """PIL AFFINE data that resamples an image of view `old` into view `new` (pan, zoom and resize)."""
     k = old.scale / new.scale
-    c = (new.cx - new.w / (2 * new.scale) - old.cx) * old.scale + old.w / 2
-    f = old.h / 2 - (new.cy - old.cy) * old.scale - new.h / 2 * k
-    return (k, 0, c, 0, k, f)
+    return (k, 0, new.ox * k - old.ox, 0, k, new.oy * k - old.oy)
 
 
 def _grid_to_view(img, grid, view, ss):
-    """Resamples an image of the grid (row 0 = top row of the grid) onto the view at ss× (bilinear)."""
+    """Resamples an image of the grid (row 0 = top row of the grid) onto the view at ss× (bilinear). For a
+    snapped view at the grid's zoom every number here is exact, so neighbouring views resample identically."""
     ny = grid.U.shape[0]
-    k = 1 / (ss * view.scale * grid.h)   # grid nodes per output pixel
-    c = (view.cx - view.w / (2 * view.scale) - grid.x0) / grid.h + 0.5
-    f = ny - 0.5 - (view.cy + view.h / (2 * view.scale) - grid.y0) / grid.h
+    s = grid.unit(view)
+    k = 1 / (ss * s)   # grid nodes per output pixel
+    c = view.ox / s - grid.i0 + 0.5
+    f = ny - 0.5 + view.oy / s + grid.j0
     return img.transform((view.w * ss, view.h * ss), Image.AFFINE, (k, 0, c, 0, k, f), Image.BILINEAR)
 
 
-def heatmap(grid, view, kind, vref, palette="studio", ss=1):
-    """Background image at ss× the view: plain, |F|, divergence or curl, read from the sampled grid."""
+def heatmap(grid, view, kind, vref, palette="studio", ss=1, image=None):
+    """Background image at ss× the view: plain, |F|, divergence or curl, read from the sampled grid
+    (or from `image`, a grid_image() made earlier)."""
     if kind == "none":
         return Image.new("RGB", (view.w * ss, view.h * ss), SURFACE)
+    if image is None:
+        image = grid_image(grid, kind, vref, palette, view)
+    return _grid_to_view(image, grid, view, ss)
+
+
+def grid_image(grid, kind, vref, palette, view):
+    """The heatmap at the grid's nodes, as an image with the top row first. `view` sets the floor of the
+    div / curl colour scale."""
     U, V = grid.U, grid.V
     if kind == "magnitude":
         idx = (np.clip(np.hypot(U, V) / vref, 0, 1) * MAG_TOP).astype(np.uint8)
@@ -143,7 +152,7 @@ def heatmap(grid, view, kind, vref, palette="studio", ss=1):
         ref = max(float(np.percentile(np.abs(q[::4, ::4]), 95)), 1e-3 * vref * view.scale / view.h)
         idx = ((np.clip(q / ref, -1, 1) + 1) * 127.5).astype(np.uint8)
         img = PALETTES[palette].div[idx]
-    return _grid_to_view(Image.fromarray(img[::-1]), grid, view, ss)
+    return Image.fromarray(np.ascontiguousarray(img[::-1]))
 
 
 def draw_guides(d, view, style, ss, grid):
@@ -165,22 +174,36 @@ def draw_guides(d, view, style, ss, grid):
         d.line([(0, oy * ss), (w, oy * ss)], fill=BORDER, width=lw)
 
 
+def _q(a):
+    """Coordinates on a 1/64 px grid. Pillow rasterises in single precision, where a point's fraction rounds
+    differently at different distances from the corner; on this grid it is exact, so a shape shifted by whole
+    pixels is drawn identically (two cached layers of neighbouring views agree)."""
+    return np.round(np.asarray(a, float) * 64) / 64
+
+
 def _head(d, tip, direction, size, color):
     """A filled triangle with its point at `tip`, pointing along the unit vector `direction`."""
     ux, uy = direction
     bx, by = tip[0] - ux * size, tip[1] - uy * size
     hw = size * 0.55
-    d.polygon([tuple(tip), (bx - uy * hw, by + ux * hw), (bx + uy * hw, by - ux * hw)], fill=color)
+    pts = _q([tip, (bx - uy * hw, by + ux * hw), (bx + uy * hw, by - ux * hw)])
+    d.polygon([tuple(p) for p in pts], fill=color)
 
 
 def draw_arrows(d, field, view, t, vref, style, colored, ss):
+    """Arrows at the world lattice (i·s, j·s), s = one arrow spacing: they stay put when the view pans, and
+    an export at k× shows the very arrows of the preview."""
     spacing, length, k = style.px(style.arrow_spacing), style.arrow_length, style.px_per_pt
-    nx, ny = max(1, round(view.w / spacing)), max(1, round(view.h / spacing))
-    X, Y = view.grid(nx, ny)
+    s = spacing / view.scale
+    x0, y1 = view.to_world(-spacing, -spacing)
+    x1, y0 = view.to_world(view.w + spacing, view.h + spacing)
+    I, J = np.meshgrid(np.arange(math.ceil(x0 / s), math.floor(x1 / s) + 1),
+                       np.arange(math.ceil(y0 / s), math.floor(y1 / s) + 1))
+    X, Y = I * s, J * s
     U, V = field(X, Y, t)
     U, V = U.ravel(), V.ravel()
     m = np.hypot(U, V)
-    cell = min(view.w / nx, view.h / ny)
+    cell = spacing
     rel = m / vref
     if style.equal_length:
         L = np.where(rel > 1e-6, 0.8 * cell * length, 0.0)
@@ -188,7 +211,7 @@ def draw_arrows(d, field, view, t, vref, style, colored, ss):
         L = 0.9 * cell * length * np.clip(rel, 0, 1.5)
     with np.errstate(all="ignore"):
         ux, uy = np.nan_to_num(U / m), np.nan_to_num(-V / m)
-    px, py = view.to_px(X.ravel(), Y.ravel())
+    px, py = I.ravel() * spacing - view.ox, -J.ravel() * spacing - view.oy   # lattice pixels, exactly
     colors = vector_colors(rel, colored, style.palette)
     width = max(1, round(style.px(style.arrow_width) * ss))
     for i in np.flatnonzero(L > 2 * k):
@@ -198,7 +221,7 @@ def draw_arrows(d, field, view, t, vref, style, colored, ss):
         tail = (px[i] - 0.5 * L[i] * dx, py[i] - 0.5 * L[i] * dy)
         neck = tip - 0.8 * hl * np.array([dx, dy])
         c = tuple(int(v) for v in colors[i])
-        d.line([(tail[0] * ss, tail[1] * ss), tuple(neck * ss)], fill=c, width=width)
+        d.line(_q([tail[0] * ss, tail[1] * ss, neck[0] * ss, neck[1] * ss]).tolist(), fill=c, width=width)
         _head(d, tip * ss, (dx, dy), hl * ss, c)
 
 
@@ -208,13 +231,16 @@ def draw_lines(d, lines, vref, colored, heads, ss, width, k=1.0, color=None, pal
     w = max(1, round(width * ss))
     plain = color or hex_to_rgb(TEXT)
     size = (4 * k + width * 2) * ss
-    for pts, speed, arrows in lines:
+    for pts, speed, arrows, first in lines:
         if len(pts) < 2:
             continue
-        p = pts * ss
+        p = _q(pts * ss)
         if colored and color is None:
             cols = vector_colors(speed / vref, True, palette)
-            for s in range(0, len(p) - 1, 8):
+            # Pieces of 8 points counted from the start of the whole line (field._lines_px cuts lines at piece
+            # boundaries), so a line cut at another place by a neighbouring view gets the same colours.
+            for s in range(-(first % 8), len(p) - 1, 8):
+                s = max(s, 0)
                 c = tuple(int(v) for v in cols[s:s + 9].mean(axis=0))
                 d.line(p[s:s + 9].ravel().tolist(), fill=c, width=w, joint="curve")
         else:
@@ -230,25 +256,35 @@ def draw_lines(d, lines, vref, colored, heads, ss, width, k=1.0, color=None, pal
                 _head(d, p[i] + u * size / 2, u, size, c)
 
 
-def compose(field, grid, view, t, vref, style, arrows=False, lines=None, traces=(), ss=2, guides=True):
+def _pad(style):
+    """Pixels drawn around a layer and cut off afterwards: shapes that cross an image edge (negative
+    coordinates) rasterise differently from the same shapes inside one, and downscaling needs neighbours."""
+    return math.ceil(style.px(max(16.0, 1.4 * style.arrow_spacing * style.arrow_length + 8)))
+
+
+def compose(field, grid, view, t, vref, style, arrows=False, lines=None, traces=(), ss=2, guides=True, heat=None):
     """The static layer: background, guides (if `guides`), streamlines, arrows (if `arrows`) and traced lines,
-    drawn at `ss`× and scaled down for antialiasing."""
+    drawn at `ss`× and scaled down for antialiasing. `heat` is a grid_image() of the background, if made.
+    The grid must reach _pad(style) px beyond the view."""
     colored = style.colored and style.background == "none"   # on a heatmap, vectors are drawn in light color
     k = style.px_per_pt
-    img = heatmap(grid, view, style.background, vref, style.palette, ss)
+    p = _pad(style)
+    pv = fieldmod.View.at(view.cx, view.cy, view.scale, view.w + 2 * p, view.h + 2 * p)
+    shift = lambda ls: [(pts + p, *rest) for pts, *rest in ls]   # view px -> padded px
+    img = heatmap(grid, pv, style.background, vref, style.palette, ss, heat)
     d = ImageDraw.Draw(img)
     if guides:
-        draw_guides(d, view, style, ss, grid=style.background == "none")
+        draw_guides(d, pv, style, ss, grid=style.background == "none")
     if lines:
-        draw_lines(d, lines, vref, colored, style.stream_heads, ss, style.px(style.line_width), k,
+        draw_lines(d, shift(lines), vref, colored, style.stream_heads, ss, style.px(style.line_width), k,
                    palette=style.palette)
     if arrows:
-        draw_arrows(d, field, view, t, vref, style, colored, ss)
+        draw_arrows(d, field, pv, t, vref, style, colored, ss)
     if traces:
-        draw_lines(d, traces, vref, False, True, ss, style.px(style.trace_width), k, color=(255, 255, 255))
+        draw_lines(d, shift(traces), vref, False, True, ss, style.px(style.trace_width), k, color=(255, 255, 255))
     if ss > 1:
-        img = img.resize((view.w, view.h), Image.LANCZOS)
-    return np.asarray(img)
+        img = img.resize((pv.w, pv.h), Image.LANCZOS)
+    return np.asarray(img)[p:p + view.h, p:p + view.w]
 
 
 def screen(a, b, gain=1.0):
@@ -259,21 +295,33 @@ def screen(a, b, gain=1.0):
 
 
 def build_static(field, view, t, style, arrows=False, streamlines=False, grid_needed=False, pins=(), ss=2,
-                 guides=True, vref=None):
+                 guides=True, vref=None, region=None, layout=None, overscan=0.25):
     """Samples the field and draws the static layer of `view`. Returns (image, grid or None, vref).
     `pins` are world points with a traced streamline; `grid_needed` asks for the grid even if nothing drawn
-    here reads it (the particles do). vref defaults to the typical speed in the view."""
+    here reads it (the particles do). vref defaults to the typical speed in the view.
+    With a viewport.Region (steady fields on the stage), its grid, layout and heatmap are used, so layers
+    built for neighbouring views agree pixel for pixel. `layout` = (grid, lines) reuses a streamline layout
+    made elsewhere (an export showing the stage's lines); `overscan` is the grid's, if one is sampled here."""
     if vref is None:
         vref = fieldmod.reference_speed(field, view, t)
-    grid = None
-    if grid_needed or streamlines or style.background != "none" or len(pins):
-        grid = fieldmod.FieldGrid(field, view, t, spacing=style.px(style.sample))
-    lines = None
-    if streamlines:
-        lines = fieldmod.streamlines(grid, view, vref, style.px(style.stream_sep), style.px(style.step))
+    step, sep = style.px(style.step), style.px(style.stream_sep)
+    grid = heat = lines = None
+    if region is not None:
+        grid = region.grid
+        if streamlines:
+            lines = fieldmod.lines_in(grid, view, region.lines(vref, style), step, sep)
+        if style.background != "none":
+            heat = region.heat(style.background, vref, style.palette, view)
+    elif grid_needed or streamlines or style.background != "none" or len(pins):
+        overscan = max(overscan, (_pad(style) + 4) / min(view.w, view.h))   # compose draws a margin too
+        grid = fieldmod.FieldGrid(field, view, t, spacing=style.px(style.sample), overscan=overscan)
+    if streamlines and lines is None:
+        if layout is not None:
+            lines = fieldmod.lines_in(layout[0], view, layout[1], step, sep)
+        else:
+            lines = fieldmod.streamlines(grid, view, vref, sep, step)
     traces = ()
     if len(pins):
-        pts = np.array([view.to_px(x, y) for x, y in pins])
-        traces = fieldmod.trace_through(grid, view, vref, pts, style.px(1.0))
-    img = compose(field, grid, view, t, vref, style, arrows, lines, traces, ss=ss, guides=guides)
+        traces = fieldmod.trace_through(grid, view, vref, pins, style.px(1.0))
+    img = compose(field, grid, view, t, vref, style, arrows, lines, traces, ss=ss, guides=guides, heat=heat)
     return img, grid, vref

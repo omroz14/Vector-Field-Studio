@@ -14,12 +14,14 @@ import export
 import field as fieldmod
 import particles
 import render
+import viewport
 import worker
 from theme import *
 
 FPS = 30           # frames per second of the animation (and of the GIF)
 PANEL_W = 290      # width of each side panel (px)
-QUICK_MS = 220     # quiet time after an interaction before the full-quality redraw
+QUICK_MS = 220     # quiet time after a slider change before the full-quality redraw
+FADE_S = 0.12      # crossfade from one static layer to a different one (a zoom, a new layout, new settings)
 POLL_MS = 8        # how often the Tk thread looks for finished renders
 EXPORT_POLL_MS = 100
 HALF_MIN, HALF_MAX = 0.25, 79.0   # zoom limits: half of the view height in world units
@@ -43,10 +45,13 @@ PROBE_ROWS = ("x, y", "F", "|F|", "Angle", "div F", "curl F")
 
 
 class Static:
-    """A finished static layer: the image for `view`, and the sampled field grid (None if nothing needed it)."""
+    """A finished static layer: the image for `view` (the stage view plus overscan), the sampled field grid
+    (None if nothing needed it), and `content`, equal for two layers that show the same thing (they differ
+    only in where they are), so switching between them needs no crossfade."""
 
-    def __init__(self, gen, view, img=None, grid=None, error=None):
+    def __init__(self, gen, view, img=None, grid=None, error=None, content=None):
         self.gen, self.view, self.img, self.grid, self.error = gen, view, img, grid, error
+        self.content = content
 
 
 def _label(options, key):
@@ -128,11 +133,18 @@ class App(ctk.CTk):
         self._worker = worker.Worker()  # builds static layers off the Tk thread
         self._gen = 0                   # number of the newest static layer asked for
         self._static = None             # newest finished Static: background + vectors, maybe for an older view
-        self._fitted = None             # (Static, view key, its image fitted to that view)
+        self._pending = None            # the view of the newest static layer asked for
+        self._region = viewport.Region()   # field samples and streamline layout around the stage (render thread)
+        self._fade = None               # (the Static faded out, start time) during a crossfade
+        self._fits = {}                 # id(Static) -> (Static, view key, its image fitted to that view)
         self._poll_id = None
         self._compiling = False         # the first run compiles the numba kernels: a note says so
         self._frame = None              # what the stage shows now
-        self._photo = None
+        self._photo = None              # one Tk image, refilled every frame
+        self._img_item = None
+        self._cap_item = None
+        self._hud_key = None            # what the axis labels and the export frame were drawn for
+        self._last_show = 0.0
         self.running = False
         self._after_id = None
         self._deadline = 0.0            # when the next animation frame is due (perf_counter seconds)
@@ -570,14 +582,21 @@ class App(ctk.CTk):
     # ---------- view: pan, zoom, traces, probe ----------
 
     def _view(self):
+        """The stage view, snapped to the pixel lattice: views at one zoom differ by whole pixels."""
         w, h = self._stage_size()
-        return fieldmod.View(self.center[0], self.center[1], self.half, w, h)
+        return viewport.snap(fieldmod.View(self.center[0], self.center[1], self.half, w, h))
 
     def _stage_size(self):
         return max(self.stage.winfo_width(), 50), max(self.stage.winfo_height(), 50)
 
     def _view_changed(self):
-        self._invalidate(quick=True)      # the particles follow on the next frame (Flow.retarget)
+        """A pan, zoom or resize. The cached static layer is shown moved at once (a crop, or resampled after a
+        zoom); a new one is rendered in the background only when the view nears the edge of the cache.
+        The particles follow on the next frame (Flow.retarget)."""
+        cache = self._pending or (self._static.view if self._static is not None else None)
+        if cache is None or viewport.needs_render(cache, self._view()):
+            self._request()
+        self._schedule_redraw()
 
     def reset_view(self):
         self.center, self.half = self.home
@@ -657,34 +676,47 @@ class App(ctk.CTk):
             if self._full_id is not None:
                 self.after_cancel(self._full_id)
             self._full_id = self.after(QUICK_MS, self._full_redraw)
-        if self._redraw_id is None:
-            self._redraw_id = self.after_idle(self._redraw)
+        self._schedule_redraw()
 
     def _full_redraw(self):
         self._full_id = None
         self._request(quick=False)
 
+    def _schedule_redraw(self):
+        """A redraw at the next frame: drag events come far faster than frames, so they are merged."""
+        if self._redraw_id is None and not self.running:   # while playing, every tick redraws
+            delay = max(1, round((self._last_show + 1 / 60 - time.perf_counter()) * 1000))
+            self._redraw_id = self.after(delay, self._redraw)
+
     def _redraw(self):
         self._redraw_id = None
-        if not self.running and self.field is not None:   # while playing, every tick redraws
+        if not self.running and self.field is not None:
             view = self._view()
             if self.flow is not None and self.mode == PARTICLES:
                 self._ensure_flow(view)
                 self.flow.restyle(self._vref(view), self._style())   # a new palette or glow, while paused
             self._show(view)
+            if self._fade is not None:
+                self._schedule_redraw()   # until the crossfade is over
 
-    def _static_job(self, view, quick, guides=True):
-        """A snapshot of everything the static layer depends on, as a job for the render thread.
-        Without `guides` it is the art alone, as exports show it."""
+    def _static_job(self, view, quick):
+        """A snapshot of everything the static layer of the cache view `view` depends on, as a job for the
+        render thread. A steady field draws from the region, so layers of neighbouring views agree."""
         gen, field, t, mode, style, pins = self._gen, self.field, self.t, self.mode, self._style(), list(self.pins)
-        vref = self._vref(view)
+        vref = self._vref()
         arrows = mode == ARROWS or self.overlay.get()
+        region = self._region if not field.uses_t else None
 
         def build():
             try:
+                if region is not None:
+                    region.prepare(field, view, style)
                 img, grid, _ = render.build_static(field, view, t, style, arrows, mode == STREAMLINES,
-                                                   mode == PARTICLES, pins, 1 if quick else 2, guides, vref)
-                return Static(gen, view, img, grid)
+                                                   mode == PARTICLES, pins, 1 if quick else 2, True, vref,
+                                                   region, overscan=0.05)
+                content = (field, style, mode, arrows, tuple(pins), quick, view.scale,
+                           region.stamp if region is not None else None)
+                return Static(gen, view, img, grid, content=content)
             except ValueError as exc:
                 return Static(gen, view, error=f"Could not evaluate the field: {exc}")
             except Exception as exc:
@@ -693,11 +725,14 @@ class App(ctk.CTk):
         return build
 
     def _request(self, quick=False):
-        """Asks the render thread for a static layer of the current view and settings."""
+        """Asks the render thread for a static layer of the current view, with overscan, and settings.
+        While a time-dependent field plays, every frame needs a new one: those get little overscan."""
         if self.field is None:
             return
         self._gen += 1
-        self._worker.submit(self._static_job(self._view(), quick))
+        overscan = 0.05 if self.running and self.field.uses_t else viewport.OVERSCAN
+        self._pending = viewport.cache_for(self._view(), overscan)
+        self._worker.submit(self._static_job(self._pending, quick))
         if self._poll_id is None:
             self._poll_id = self.after(POLL_MS, self._poll)
 
@@ -708,8 +743,7 @@ class App(ctk.CTk):
             got = self._worker.results.get()
         if got is not None:
             self._accept(got)
-            if not self.running:
-                self._redraw()
+            self._schedule_redraw()
         if self._static is None or self._static.gen < self._gen:
             self._poll_id = self.after(POLL_MS, self._poll)
 
@@ -725,6 +759,9 @@ class App(ctk.CTk):
         if self._static is None and self._compiling:
             self._compiling = False
             self._status("Ready. Pick a preset or type your own Fx and Fy. Space animates the flow.")
+        old = self._static
+        if old is not None and old.content != static.content and not (self.running and self.field.uses_t):
+            self._fade = (old, time.perf_counter())
         self._static = static
 
     def _compiling_note(self):
@@ -732,46 +769,74 @@ class App(ctk.CTk):
         if self._compiling:
             self._status("Compiling the numerical kernels. This happens only on the first run and takes a few seconds…")
 
-    def _fit_static(self, view):
-        """The newest static layer as seen from `view`. One built for an older view (the user is panning or
-        zooming and the new one is not ready yet) is moved and scaled to match, so it never lags behind."""
-        st = self._static
-        if st is None:
-            return np.full((view.h, view.w, 3), hex_to_rgb(SURFACE), np.uint8)
-        key = (view.cx, view.cy, view.scale, view.w, view.h)
-        if self._fitted is not None and self._fitted[0] is st and self._fitted[1] == key:
-            return self._fitted[2]
-        old = st.view
-        if (old.cx, old.cy, old.scale, old.w, old.h) == key:
-            img = st.img
+    def _fit(self, st, view):
+        """The static layer `st` as seen from `view`: a crop of it when the view lies inside it at its zoom
+        (a pan), else resampled (a zoom, or a pan past it before the next one is ready)."""
+        key = (view.ox, view.oy, view.scale, view.w, view.h)
+        hit = self._fits.get(id(st))
+        if hit is not None and hit[0] is st and hit[1] == key:
+            return hit[2]
+        off = viewport.offset(view, st.view)
+        if off is not None:
+            dx, dy = off
+            img = st.img[dy:dy + view.h, dx:dx + view.w]
         else:
             img = np.asarray(Image.fromarray(st.img).transform(
-                (view.w, view.h), Image.AFFINE, render.view_affine(old, view), Image.BILINEAR, fillcolor=SURFACE))
-        self._fitted = (st, key, img)
+                (view.w, view.h), Image.AFFINE, render.view_affine(st.view, view), Image.BILINEAR, fillcolor=SURFACE))
+        keep = {id(self._static)} | ({id(self._fade[0])} if self._fade else set())
+        self._fits = {k: v for k, v in self._fits.items() if k in keep}
+        self._fits[id(st)] = (st, key, img)
         return img
 
     def _compose(self, view, static=None):
-        """The frame to show: the static layer (the newest one, unless given), plus the particle trails
-        screen-blended on top in the Particles view."""
+        """The frame to show: the static layer (the newest one, crossfading from the one before), plus the
+        particle trails screen-blended on top in the Particles view."""
         if static is None:
-            static = self._fit_static(view)
+            if self._static is None:
+                static = np.full((view.h, view.w, 3), hex_to_rgb(SURFACE), np.uint8)
+            else:
+                static = self._fit(self._static, view)
+                if self._fade is not None:
+                    old, start = self._fade
+                    a = (time.perf_counter() - start) / FADE_S
+                    if a >= 1:
+                        self._fade = None
+                    else:
+                        static = np.asarray(Image.blend(Image.fromarray(np.ascontiguousarray(self._fit(old, view))),
+                                                        Image.fromarray(np.ascontiguousarray(static)), a))
         if self.mode != PARTICLES:
             return static
         self._ensure_flow(view)
         return render.screen(static, self.flow.image())
 
     def _show(self, view):
+        """Puts the frame on the stage. The Tk image and the caption are kept and refilled; the axis labels and
+        the export frame are drawn again only when the view or the export size changed."""
         self._frame = self._compose(view)
-        self._photo = ImageTk.PhotoImage(Image.fromarray(self._frame))
+        img = Image.fromarray(np.ascontiguousarray(self._frame))
         s = self.stage
-        s.delete("all")
-        s.create_image(0, 0, image=self._photo, anchor="nw")
-        w, h = self._ex_dims()
-        x, y, fw, fh = export.frame_rect(view, w, h)
-        s.create_rectangle(x, y, x + fw, y + fh, outline=MUTED, dash=(6, 4))
-        s.create_text(x + fw - 6, y + 6, anchor="ne", fill=MUTED, font=FONT_SMALL, text=f"{self.ex_size} · {w} × {h}")
-        self._draw_ticks(view)
-        s.create_text(10, 6, anchor="nw", fill=MUTED, font=FONT_SECTION, text=self._caption())
+        if self._photo is None or (self._photo.width(), self._photo.height()) != (view.w, view.h):
+            self._photo = ImageTk.PhotoImage(img)
+            if self._img_item is None:
+                self._img_item = s.create_image(0, 0, image=self._photo, anchor="nw")
+                self._cap_item = s.create_text(10, 6, anchor="nw", fill=MUTED, font=FONT_SECTION)
+            else:
+                s.itemconfigure(self._img_item, image=self._photo)
+        else:
+            self._photo.paste(img)
+        hud = (view.ox, view.oy, view.scale, view.w, view.h, self.ex_size)
+        if hud != self._hud_key:
+            self._hud_key = hud
+            s.delete("hud")
+            w, h = self._ex_dims()
+            x, y, fw, fh = export.frame_rect(view, w, h)
+            s.create_rectangle(x, y, x + fw, y + fh, outline=MUTED, dash=(6, 4), tags="hud")
+            s.create_text(x + fw - 6, y + 6, anchor="ne", fill=MUTED, font=FONT_SMALL,
+                          text=f"{self.ex_size} · {w} × {h}", tags="hud")
+            self._draw_ticks(view)
+        s.itemconfigure(self._cap_item, text=self._caption())
+        s.tag_raise(self._cap_item)
+        self._last_show = time.perf_counter()
 
     def _draw_ticks(self, view):
         """Coordinate labels along the bottom and left edges."""
@@ -780,11 +845,13 @@ class App(ctk.CTk):
         for x in xs:
             px = view.to_px(x, 0)[0]
             if 20 < px < view.w - 20:
-                self.stage.create_text(px, view.h - 4, anchor="s", fill=MUTED, font=FONT_SMALL, text=f"{x:.{dec}f}")
+                self.stage.create_text(px, view.h - 4, anchor="s", fill=MUTED, font=FONT_SMALL, text=f"{x:.{dec}f}",
+                                       tags="hud")
         for y in ys:
             py = view.to_px(0, y)[1]
             if 30 < py < view.h - 24:
-                self.stage.create_text(6, py, anchor="w", fill=MUTED, font=FONT_SMALL, text=f"{y:.{dec}f}")
+                self.stage.create_text(6, py, anchor="w", fill=MUTED, font=FONT_SMALL, text=f"{y:.{dec}f}",
+                                       tags="hud")
 
     def _caption(self):
         f = self.field
@@ -868,7 +935,7 @@ class App(ctk.CTk):
         return export.Scene(self.field, self._style(), self.t, self.t_rate,
                             arrows=self.mode == ARROWS or self.overlay.get(), streamlines=self.mode == STREAMLINES,
                             density=self.density if self.mode == PARTICLES else 0, pins=tuple(self.pins),
-                            vref=self._vref())
+                            vref=self._vref(), layout=self._region.layout if not self.field.uses_t else None)
 
     def _ex_settings(self, fmt):
         w, h = self._ex_dims()

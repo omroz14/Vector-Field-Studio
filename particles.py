@@ -43,6 +43,16 @@ def frame_dt(field, view, style, vref, fps, t_rate):
     return style.particle_speed * style.px_per_pt / (fps * vref * view.scale)
 
 
+def _shifted(buf, dx, dy):
+    """The buffer as seen from a view dx, dy pixels further right and down (empty where it was not)."""
+    out = np.zeros_like(buf)
+    h, w = buf.shape
+    if abs(dx) < w and abs(dy) < h:
+        out[max(0, -dy):h - max(0, dy), max(0, -dx):w - max(0, dx)] = \
+            buf[max(0, dy):h - max(0, -dy), max(0, dx):w - max(0, -dx)]
+    return out
+
+
 def _smoothstep(u):
     u = np.clip(u, 0.0, 1.0)
     return u * u * (3 - 2 * u)
@@ -258,9 +268,13 @@ class Flow:
         old = self.view
         if (old.cx, old.cy, old.scale, old.w, old.h) == (view.cx, view.cy, view.scale, view.w, view.h):
             return
-        a = render.view_affine(old, view)
-        self.D, self.S = (np.array(Image.fromarray(b, "F").transform(
-            (view.w, view.h), Image.AFFINE, a, Image.BILINEAR, fillcolor=0), np.float32) for b in (self.D, self.S))
+        dx, dy = view.ox - old.ox, view.oy - old.oy
+        if view.scale == old.scale and (view.w, view.h) == (old.w, old.h) and dx == round(dx) and dy == round(dy):
+            self.D, self.S = _shifted(self.D, int(dx), int(dy)), _shifted(self.S, int(dx), int(dy))   # a pan
+        else:
+            a = render.view_affine(old, view)
+            self.D, self.S = (np.array(Image.fromarray(b, "F").transform(
+                (view.w, view.h), Image.AFFINE, a, Image.BILINEAR, fillcolor=0), np.float32) for b in (self.D, self.S))
         self.rgb = np.zeros((view.h, view.w, 3), np.uint8)
         self.view = view
         self._layout()

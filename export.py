@@ -48,6 +48,7 @@ class Scene:
     density: float = 0.0
     pins: tuple = ()
     vref: float = None
+    layout: tuple = None    # (grid, streamline layout) of the stage, so the export shows the same lines
 
 
 @dataclass(frozen=True)
@@ -116,7 +117,8 @@ class Renderer:
             return self._steady
         if record or not sc.field.uses_t:
             img, grid, _ = render.build_static(sc.field, self.view, t, self.style, sc.arrows, sc.streamlines,
-                                               self.flow is not None, sc.pins, st.ss, st.grid, self.vref)
+                                               self.flow is not None, sc.pins, st.ss, st.grid, self.vref,
+                                               layout=sc.layout)
         else:   # warming up a time-dependent field: the particles need only the grid
             img, grid = None, fieldmod.FieldGrid(sc.field, self.view, t, spacing=self.style.px(self.style.sample))
         if not sc.field.uses_t:
