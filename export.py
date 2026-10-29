@@ -226,12 +226,20 @@ class FFmpegWriter:
 
     def close(self):
         self._proc.stdin.close()
-        if self._proc.wait():
-            raise RuntimeError(self._error())
+        failed = self._proc.wait()
+        message = self._error() if failed else None
+        self._err.close()
+        if failed:
+            raise RuntimeError(message)
 
     def abort(self):
         self._proc.kill()
         self._proc.wait()
+        try:
+            self._proc.stdin.close()
+        except OSError:   # the pipe is broken: ffmpeg is gone
+            pass
+        self._err.close()
 
 
 class StillWriter:
