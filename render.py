@@ -10,6 +10,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 import field as fieldmod
+import kernels
 from theme import *
 
 GRID = "#1b1f2a"   # faint grid lines on the plain background
@@ -32,7 +33,9 @@ class Style:
     stream_heads: bool = True
     line_width: float = 1.3
     trace_width: float = 2.4
-    particle_size: float = 2.0   # side of a particle dot; never under 2 px, so trails survive 4:2:0 video
+    particle_size: float = 2.0   # width of a particle's trail; never under 2 px, so it survives 4:2:0 video
+    particle_gain: float = 2.5   # κ: trail brightness is 1 − exp(−κ · density)
+    glow: bool = False           # a soft halo around the trails
     particle_speed: float = 90.0 # points per second at the typical speed |F| = vref (steady fields)
     trail: float = 0.65          # seconds: time constant of the trail fade (0 = no trail)
     substep: float = 1.2         # points between the dots that join a particle's old and new position
@@ -103,6 +106,14 @@ def ticks(view, target_px=90.0):
     xs = np.arange(math.ceil(x0 / step), math.floor(x1 / step) + 1) * step
     ys = np.arange(math.ceil(y0 / step), math.floor(y1 / step) + 1) * step
     return step, xs, ys
+
+
+def view_affine(old, new):
+    """PIL AFFINE data that resamples an image of view `old` into view `new` (pan, zoom and resize)."""
+    k = old.scale / new.scale
+    c = (new.cx - new.w / (2 * new.scale) - old.cx) * old.scale + old.w / 2
+    f = old.h / 2 - (new.cy - old.cy) * old.scale - new.h / 2 * k
+    return (k, 0, c, 0, k, f)
 
 
 def _grid_to_view(img, grid, view, ss):
@@ -240,11 +251,11 @@ def compose(field, grid, view, t, vref, style, arrows=False, lines=None, traces=
     return np.asarray(img)
 
 
-def screen(a, b):
-    """Screen blend of two uint8 images, 1 − (1 − a)(1 − b): light adds up without clipping to the brighter one."""
-    a = a.astype(np.uint16)
-    b = b.astype(np.uint16)
-    return (a + b - (a * b + 127) // 255).astype(np.uint8)
+def screen(a, b, gain=1.0):
+    """Screen blend of two uint8 images, 1 − (1 − a)(1 − gain·b): light adds up without clipping to the brighter one."""
+    out = np.empty_like(a)
+    kernels.screen(np.ascontiguousarray(a), np.ascontiguousarray(b), float(gain), out)
+    return out
 
 
 def build_static(field, view, t, style, arrows=False, streamlines=False, grid_needed=False, pins=(), ss=2,

@@ -107,6 +107,7 @@ class App(ctk.CTk):
         self.overlay = tk.BooleanVar(value=False)    # arrows in every view
         self.stream_sep = 22
         self.stream_heads = tk.BooleanVar(value=True)
+        self.glow = tk.BooleanVar(value=False)
         self.density = 25               # particles per 100 × 100 points, on the stage and in exports
         self.p_speed = 3                # × 30 points per second at the typical speed (steady fields)
         self.trail_s = 0.65             # seconds: how long trails take to fade
@@ -114,6 +115,8 @@ class App(ctk.CTk):
         self.pins = []                  # world points with a traced streamline
 
         self.flow = None                # particles and their trails (particles.Flow)
+        self._vref_key = None           # (field, zoom) the typical speed below belongs to
+        self._vref_val = 1.0
         self.ex_size = "4:5"            # export: key of export.SIZES
         self.ex_format = "mp4"
         self.ex_fps = 30
@@ -254,6 +257,7 @@ class App(ctk.CTk):
         self.row_speed = SliderRow(c, "Speed", 1, 12, self.p_speed, self._on_speed, fmt=lambda v: f"{v}×")
         self.row_trail = SliderRow(c, "Trail", 0, 300, round(self.trail_s * 100), self._on_trail,
                                    fmt=lambda v: "none" if v == 0 else f"{v / 100:.2f} s")
+        switch(c, "Glow", self.glow, lambda: self._invalidate(static=False)).pack(anchor="w", padx=PAD, pady=(8, 0))
         note(c, "For a field that uses t, the time rate under the stage sets the speed.", pady=(4, PAD))
 
         # PROBE
@@ -410,9 +414,7 @@ class App(ctk.CTk):
         self.palette = key
         self.palette_grid.select(key)
         self._draw_colorbar()
-        if self.flow is not None:
-            self.flow.clear()             # old trails keep the colors of the previous palette
-        self._invalidate()
+        self._invalidate()                # trails keep only speeds: they take the new palette at once
 
     def _cycle_palette(self):
         keys = [k for k, _ in render.PALETTE_NAMES]
@@ -509,7 +511,16 @@ class App(ctk.CTk):
             px_per_pt=px_per_pt, palette=self.palette, background=self.bg_kind, colored=self.colored.get(),
             arrow_spacing=self.arrow_spacing, arrow_length=self.arrow_len / 100,
             equal_length=self.equal_len.get(), stream_sep=self.stream_sep, stream_heads=self.stream_heads.get(),
-            particle_speed=30.0 * self.p_speed, trail=self.trail_s)
+            particle_speed=30.0 * self.p_speed, trail=self.trail_s, glow=self.glow.get())
+
+    def _vref(self, view=None):
+        """The typical speed |F| that colours and particle pace refer to. It is fixed per field and zoom,
+        so neither drifts while time runs or the view pans."""
+        key = (self.field, self.half)
+        if self._vref_key != key:
+            self._vref_key = key
+            self._vref_val = fieldmod.reference_speed(self.field, view or self._view(), self.t)
+        return self._vref_val
 
     # ---------- view: pan, zoom, traces, probe ----------
 
@@ -521,9 +532,7 @@ class App(ctk.CTk):
         return max(self.stage.winfo_width(), 50), max(self.stage.winfo_height(), 50)
 
     def _view_changed(self):
-        self._invalidate(quick=True)
-        if self.flow is not None:
-            self.flow.clear()             # trails are in screen space; particles stay in the world
+        self._invalidate(quick=True)      # the particles follow on the next frame (Flow.retarget)
 
     def reset_view(self):
         self.center, self.half = self.home
@@ -613,18 +622,23 @@ class App(ctk.CTk):
     def _redraw(self):
         self._redraw_id = None
         if not self.running and self.field is not None:   # while playing, every tick redraws
-            self._show(self._view())
+            view = self._view()
+            if self.flow is not None and self.mode == PARTICLES:
+                self._ensure_flow(view)
+                self.flow.restyle(self._vref(view), self._style())   # a new palette or glow, while paused
+            self._show(view)
 
     def _static_job(self, view, quick, guides=True):
         """A snapshot of everything the static layer depends on, as a job for the render thread.
         Without `guides` it is the art alone, as exports show it."""
         gen, field, t, mode, style, pins = self._gen, self.field, self.t, self.mode, self._style(), list(self.pins)
+        vref = self._vref(view)
         arrows = mode == ARROWS or self.overlay.get()
 
         def build():
             try:
                 img, grid, _ = render.build_static(field, view, t, style, arrows, mode == STREAMLINES,
-                                                   mode == PARTICLES, pins, 1 if quick else 2, guides)
+                                                   mode == PARTICLES, pins, 1 if quick else 2, guides, vref)
                 return Static(gen, view, img, grid)
             except ValueError as exc:
                 return Static(gen, view, error=f"Could not evaluate the field: {exc}")
@@ -686,11 +700,8 @@ class App(ctk.CTk):
         if (old.cx, old.cy, old.scale, old.w, old.h) == key:
             img = st.img
         else:
-            k = old.scale / view.scale
-            c = (view.cx - view.w / (2 * view.scale) - old.cx) * old.scale + old.w / 2
-            f = old.h / 2 - (view.cy - old.cy) * old.scale - view.h / 2 * k
             img = np.asarray(Image.fromarray(st.img).transform(
-                (view.w, view.h), Image.AFFINE, (k, 0, c, 0, k, f), Image.BILINEAR, fillcolor=SURFACE))
+                (view.w, view.h), Image.AFFINE, render.view_affine(old, view), Image.BILINEAR, fillcolor=SURFACE))
         self._fitted = (st, key, img)
         return img
 
@@ -742,18 +753,18 @@ class App(ctk.CTk):
     # ---------- particles and time ----------
 
     def _ensure_flow(self, view):
-        """Particles for `view`: new ones if there are none or the stage changed size."""
-        if self.flow is not None and (self.flow.view.w, self.flow.view.h) == (view.w, view.h):
-            self.flow.view = view
-            return
-        self.flow = particles.Flow(round(self.density * view.w * view.h / 1e4), view, FPS)
-        self.flow.paint(self.field, self.t, fieldmod.reference_speed(self.field, view, self.t), self._style())
+        """Particles for `view`: new ones if there are none, else the old ones follow the view."""
+        if self.flow is None:
+            self.flow = particles.Flow(self.density, view, FPS)
+            self.flow.paint(self.field, self.t, self._vref(view), self._style())
+        else:
+            self.flow.retarget(view, self._vref(view), self._style())
 
     def _step(self, view, static=None):
         """Advances time by one frame, and the particles with it in the Particles view. They move through the
         grid of `static`, by default the newest static layer."""
         style = self._style()
-        vref = fieldmod.reference_speed(self.field, view, self.t)
+        vref = self._vref(view)
         dt = particles.frame_dt(self.field, view, style, vref, FPS, self.t_rate)
         static = static or self._static
         grid = static.grid if static is not None else None
@@ -811,7 +822,8 @@ class App(ctk.CTk):
         """What the stage shows now, for an export."""
         return export.Scene(self.field, self._style(), self.t, self.t_rate,
                             arrows=self.mode == ARROWS or self.overlay.get(), streamlines=self.mode == STREAMLINES,
-                            density=self.density if self.mode == PARTICLES else 0, pins=tuple(self.pins))
+                            density=self.density if self.mode == PARTICLES else 0, pins=tuple(self.pins),
+                            vref=self._vref())
 
     def _ex_settings(self, fmt):
         w, h = self._ex_dims()

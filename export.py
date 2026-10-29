@@ -37,7 +37,7 @@ def frame_rect(view, w, h, margin=FRAME_MARGIN):
 @dataclass(frozen=True)
 class Scene:
     """What the stage shows, frozen when an export starts. `style` is the stage style (px_per_pt 1);
-    `density` is particles per 100 × 100 points, 0 for none."""
+    `density` is particles per 100 × 100 points, 0 for none; `vref` the stage's typical speed (None: measure)."""
     field: object
     style: render.Style
     t: float = 0.0
@@ -46,6 +46,7 @@ class Scene:
     streamlines: bool = False
     density: float = 0.0
     pins: tuple = ()
+    vref: float = None
 
 
 @dataclass(frozen=True)
@@ -73,9 +74,10 @@ class Renderer:
         self.view = fieldmod.View(cx, cy, fh / (2 * stage.scale), settings.width, settings.height)
         self.style = replace(scene.style, px_per_pt=settings.height / fh)
         # The colour scale and the particle pace of the preview, held for the whole export.
-        self.vref = fieldmod.reference_speed(scene.field, stage, scene.t)
-        n = round(scene.density * fw * fh / 1e4)
-        self.flow = particles.Flow(n, self.view, settings.fps, seed) if n else None
+        self.vref = scene.vref or fieldmod.reference_speed(scene.field, stage, scene.t)
+        self.flow = None
+        if scene.density > 0:
+            self.flow = particles.Flow(scene.density, self.view, settings.fps, self.style.px_per_pt, seed)
         self._steady = None   # (image, grid) of a steady field, built once
         self.warm_up = 0      # frames the particles run before the first recorded one, so trails are grown
         if self.flow is not None:

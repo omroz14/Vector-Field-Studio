@@ -306,6 +306,72 @@ def advect(U, V, x0, y0, h, X, Y, dt, speed, alive):
         alive[n] = True
 
 
+# ---------- particle trails ----------
+
+@_jit
+def splat_paths(D, S, x0, y0, x1, y1, w, speed, nsub, rho):
+    """Draws each path (x0, y0) -> (x1, y1) in pixels as nsub samples (the start point belongs to the previous
+    frame) into the density D and the speed-weighted density S. A sample adds a tent of radius rho px with
+    peak w: rho = 1 is a bilinear splat, a larger rho a proportionally wider one. Pixel i is centred at i + 0.5."""
+    h, wd = D.shape
+    r = int(math.ceil(rho))
+    for n in range(x0.size):
+        wn = w[n]
+        if wn <= 0.0:
+            continue
+        sn = wn * speed[n]
+        for k in range(1, nsub + 1):
+            a = k / nsub
+            x = x0[n] + a * (x1[n] - x0[n]) - 0.5
+            y = y0[n] + a * (y1[n] - y0[n]) - 0.5
+            if not (-rho < x < wd - 1 + rho and -rho < y < h - 1 + rho):
+                continue
+            ix, iy = int(math.floor(x)), int(math.floor(y))
+            for j in range(max(iy - r + 1, 0), min(iy + r + 1, h)):
+                wy = 1.0 - abs(y - j) / rho
+                if wy <= 0.0:
+                    continue
+                for i in range(max(ix - r + 1, 0), min(ix + r + 1, wd)):
+                    wx = 1.0 - abs(x - i) / rho
+                    if wx > 0.0:
+                        D[j, i] += wn * wx * wy
+                        S[j, i] += sn * wx * wy
+
+
+@nb.njit(cache=True, nogil=True, parallel=True)
+def tonemap(D, S, kappa, inv_vref, lut, delta, out):
+    """Trail colours into out (uint8 h × w × 3): brightness 1 − exp(−κD), colour lut[S / (D·vref)], so dense
+    trails saturate softly and every pixel shows the mean speed of what passed it. Then fades D and S by delta
+    for the next frame (tiny values go to zero, so they never turn into slow denormals)."""
+    h, w = D.shape
+    for j in nb.prange(h):
+        for i in range(w):
+            d = D[j, i]
+            if d > 1e-4:
+                b = 1.0 - math.exp(-kappa * d)
+                q = int(min(max(S[j, i] / d * inv_vref, 0.0), 1.0) * 255.0)
+                for c in range(3):
+                    out[j, i, c] = np.uint8(b * lut[q, c] + 0.5)
+                D[j, i] = d * delta
+                S[j, i] *= delta
+            else:
+                out[j, i, 0] = out[j, i, 1] = out[j, i, 2] = 0
+                D[j, i] = 0.0
+                S[j, i] = 0.0
+
+
+@nb.njit(cache=True, nogil=True, parallel=True)
+def screen(a, b, gain, out):
+    """Screen blend of uint8 images, out = 1 − (1 − a)(1 − gain·b): light adds up without clipping. out may be a."""
+    h, w, nc = a.shape
+    for j in nb.prange(h):
+        for i in range(w):
+            for c in range(nc):
+                x = float(a[j, i, c])
+                y = gain * b[j, i, c]
+                out[j, i, c] = np.uint8(min(x + y - x * y / 255.0, 255.0) + 0.5)
+
+
 def warm_up():
     """Compiles (or loads from the disk cache) every kernel on a tiny grid."""
     g = np.linspace(-1, 1, 16)
@@ -315,3 +381,9 @@ def warm_up():
     trace_through(U, V, [8.0], [4.0], 0.5, 1e-9)
     px, py = np.array([0.5]), np.array([0.0])
     advect(U, V, -1.0, -1.0, 2 / 15, px, py, 0.01, np.empty(1), np.empty(1, np.bool_))
+    D, S = np.zeros((4, 4), np.float32), np.zeros((4, 4), np.float32)
+    one = np.ones(1)
+    splat_paths(D, S, one, one, 2 * one, 2 * one, one, one, 2, 1.0)
+    rgb = np.zeros((4, 4, 3), np.uint8)
+    tonemap(D, S, 2.0, 1.0, np.zeros((256, 3), np.float32), 0.9, rgb)
+    screen(rgb, rgb, 1.0, rgb)
