@@ -11,6 +11,7 @@ from PIL import Image, ImageDraw
 
 import field as fieldmod
 import kernels
+from palettes import PALETTES, PALETTE_NAMES
 from theme import *
 
 GRID = "#1b1f2a"   # faint grid lines on the plain background
@@ -47,42 +48,6 @@ class Style:
         return pt * self.px_per_pt
 
 
-def _ramp(stops, pos):
-    xs = np.linspace(0, 1, 256)
-    lut = np.zeros((256, 3), np.uint8)
-    rgb = [hex_to_rgb(s) for s in stops]
-    for c in range(3):
-        lut[:, c] = np.interp(xs, pos, [s[c] for s in rgb])
-    return lut
-
-
-class Palette:
-    """A color scheme: `seq` for the magnitude (0 -> fast), `div` for signed quantities (negative -> positive),
-    and `line` for vectors on the plain background: the bright part of `seq`, so slow vectors stay visible."""
-
-    def __init__(self, seq, div, seq_pos=None):
-        self.seq = _ramp(seq, seq_pos or np.linspace(0, 1, len(seq)))
-        self.div = _ramp(div, np.linspace(0, 1, len(div)))
-        self.line = self.seq[np.linspace(90, 255, 256).astype(int)]
-
-
-# Sequential stops run from slow to fast; diverging stops have the stage color in the middle, at zero.
-PALETTES = {
-    "studio": Palette([SURFACE, ACCENT, WARM, "#ffffff"],     # the motion map palette of Pixel Sort Studio
-                      ["#d6ccff", ACCENT, SURFACE, WARM, "#ffe2b8"], [0.0, 0.4, 0.75, 1.0]),
-    "viridis": Palette(["#440154", "#3b528b", "#21918c", "#5ec962", "#fde725"],
-                       ["#b4c8ff", "#3b6fd8", SURFACE, "#d8503b", "#ffc4a8"]),
-    "magma": Palette(["#000004", "#3b0f70", "#8c2981", "#de4968", "#fe9f6d", "#fcfdbf"],
-                     ["#a8f0e0", "#2a9d8f", SURFACE, "#de4968", "#fcc5c0"]),
-    "ice": Palette([SURFACE, "#16425b", "#2a87b0", "#7fd3e6", "#f2fbff"],
-                   ["#7fd3e6", "#2a87b0", SURFACE, "#c98a2e", "#ffe2b8"]),
-    "fire": Palette([SURFACE, "#5c1a1a", "#c0392b", "#f39c12", "#fff3b0"],
-                    ["#7fd3e6", "#2a87b0", SURFACE, "#c0392b", "#f39c12"]),
-    "turbo": Palette(["#30123b", "#4669db", "#26bce1", "#5ffc73", "#d0e935", "#fb8022", "#7a0403"],
-                     ["#26bce1", "#4669db", SURFACE, "#fb8022", "#d0e935"]),
-}
-PALETTE_NAMES = (("studio", "Studio"), ("viridis", "Viridis"), ("magma", "Magma"),
-                 ("ice", "Ice"), ("fire", "Fire"), ("turbo", "Turbo"))
 MAG_TOP = 200      # the magnitude heatmap stops short of the brightest color so vectors stay readable on it
 
 

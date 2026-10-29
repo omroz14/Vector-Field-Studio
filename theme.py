@@ -120,14 +120,22 @@ class ChoiceGrid:
 
     def __init__(self, master, options, current, command, cols=2):
         self.buttons = {}
-        wrap = ctk.CTkFrame(master, fg_color="transparent")
-        wrap.pack(fill="x", padx=PAD - 2)
-        for i, (key, label) in enumerate(options):
-            b = button(wrap, label, lambda k=key: command(k), height=30)
-            b.grid(row=i // cols, column=i % cols, sticky="ew", padx=2, pady=2)
-            self.buttons[key] = b
+        self._command, self._cols = command, cols
+        self.wrap = ctk.CTkFrame(master, fg_color="transparent")
+        self.wrap.pack(fill="x", padx=PAD - 2)
         for c in range(cols):
-            wrap.columnconfigure(c, weight=1, uniform="col")
+            self.wrap.columnconfigure(c, weight=1, uniform="col")
+        self.set_options(options, current)
+
+    def set_options(self, options, current):
+        """Replaces the buttons (when the list of choices changes)."""
+        for b in self.buttons.values():
+            b.destroy()
+        self.buttons = {}
+        for i, (key, label) in enumerate(options):
+            b = button(self.wrap, label, lambda k=key: self._command(k), height=30)
+            b.grid(row=i // self._cols, column=i % self._cols, sticky="ew", padx=2, pady=2)
+            self.buttons[key] = b
         self.select(current)
 
     def select(self, current):

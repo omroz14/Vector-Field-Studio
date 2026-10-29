@@ -12,16 +12,22 @@ from PIL import Image, ImageTk
 
 import export
 import field as fieldmod
+import palettes
 import particles
 import render
 import viewport
 import worker
+from palette_editor import PaletteEditor
 from theme import *
 
 FPS = 30           # frames per second of the animation (and of the GIF)
 PANEL_W = 290      # width of each side panel (px)
 QUICK_MS = 220     # quiet time after a slider change before the full-quality redraw
 FADE_S = 0.12      # crossfade from one static layer to a different one (a zoom, a new layout, new settings)
+GUTTER_L, GUTTER_B = 34, 22   # px of ruler beside and under the image, for the axis numbers
+DIM = 115          # the stage outside the export frame is shown at DIM / 256 (≈ 45 %) of its brightness
+EASE_S = 0.2       # double-click centring glides there in this time
+SHIFT, CONTROL = 0x0001, 0x0004   # Tk event.state bits
 POLL_MS = 8        # how often the Tk thread looks for finished renders
 EXPORT_POLL_MS = 100
 HALF_MIN, HALF_MAX = 0.25, 79.0   # zoom limits: half of the view height in world units
@@ -52,6 +58,16 @@ class Static:
     def __init__(self, gen, view, img=None, grid=None, error=None, content=None):
         self.gen, self.view, self.img, self.grid, self.error = gen, view, img, grid, error
         self.content = content
+
+
+def _dim_outside(frame, rect):
+    """A copy of the frame darkened to DIM / 256 outside the rectangle (x, y, w, h)."""
+    out = np.array(frame)
+    x0, y0 = max(round(rect[0]), 0), max(round(rect[1]), 0)
+    x1, y1 = round(rect[0] + rect[2]), round(rect[1] + rect[3])
+    for part in (out[:y0], out[y1:], out[y0:y1, :x0], out[y0:y1, x1:]):
+        part[:] = (part.astype(np.uint16) * DIM >> 8).astype(np.uint8)
+    return out
 
 
 def _label(options, key):
@@ -85,6 +101,7 @@ def _short(expr, n=34):
 
 
 def _num(v):
+    v += 0.0   # no "-0"
     return f"{v:.3g}" if abs(v) >= 1e-3 or v == 0 else f"{v:.2e}"
 
 
@@ -118,6 +135,9 @@ class App(ctk.CTk):
         self.trail_s = 0.65             # seconds: how long trails take to fade
         self.t_rate = 0.5               # units of t per second (fields that use t)
         self.pins = []                  # world points with a traced streamline
+        self.show_frame = tk.BooleanVar(value=True)   # the export frame on the stage, the outside dimmed
+        self.show_scale = tk.BooleanVar(value=True)   # a scale bar in the corner
+        self._ease_id = None
 
         self.flow = None                # particles and their trails (particles.Flow)
         self._vref_key = None           # (field, zoom) the typical speed below belongs to
@@ -153,11 +173,12 @@ class App(ctk.CTk):
         self._press = None
         self._dragging = False
 
+        palette_error = palettes.load_user()
         self._build_ui()
         self._bind_keys()
         self.set_preset(self.preset)
         self.set_mode(ARROWS)
-        self._status("Pick a preset or type your own Fx and Fy. Space animates the flow.")
+        self._status(palette_error or "Pick a preset or type your own Fx and Fy. Space animates the flow.")
         self.after(800, self._compiling_note)
 
     # ---------- building the interface ----------
@@ -215,12 +236,26 @@ class App(ctk.CTk):
         c = card(left, "VIEW", "key R")
         self.row_zoom = SliderRow(c, "Zoom", 0, 100, round(_slider_from(self.half)), self._on_zoom,
                                   fmt=lambda v: f"±{_half_from(v):.3g}")
+        er = ctk.CTkFrame(c, fg_color="transparent")
+        er.pack(fill="x", padx=PAD, pady=(6, 0))
+        self.ent_view = {}
+        for i, name in enumerate(("x", "y", "±")):
+            ctk.CTkLabel(er, text=name, font=FONT, text_color=MUTED, width=12).pack(side="left", padx=(0 if i == 0 else 6, 3))
+            e = entry(er, width=10)
+            e.pack(side="left", fill="x", expand=True)
+            e.bind("<Return>", lambda ev: self.apply_view())
+            e.bind("<Escape>", lambda ev: self.stage.focus_set())
+            self.ent_view[name] = e
         vb = ctk.CTkFrame(c, fg_color="transparent")
-        vb.pack(fill="x", padx=PAD, pady=(6, 0))
+        vb.pack(fill="x", padx=PAD, pady=(8, 0))
         button(vb, "Reset view", self.reset_view, width=10).pack(side="left", fill="x", expand=True)
         button(vb, "Clear traces", self.clear_pins, width=10).pack(side="left", fill="x", expand=True, padx=(6, 0))
-        note(c, "Scroll to zoom, drag to pan. Click to trace the streamline through a point; "
-                "right-click clears the traces.", pady=(8, PAD))
+        switch(c, "Export frame on the stage", self.show_frame, self._hud_changed).pack(
+            anchor="w", padx=PAD, pady=(10, 4))
+        switch(c, "Scale bar", self.show_scale, self._hud_changed).pack(anchor="w", padx=PAD, pady=(4, 0))
+        note(c, "Scroll or +/− to zoom, drag or arrow keys to pan (Shift: further; Ctrl-drag snaps the centre to "
+                "the grid). Double-click centres a point, F fits the stage into the export frame. Shift+click "
+                "traces the streamline through a point; right-click clears the traces.", pady=(8, PAD))
 
     def _build_right(self, right):
         """How to show it: colors, arrows, streamlines, particles, the probe and export."""
@@ -232,8 +267,12 @@ class App(ctk.CTk):
         self.bg_tabs.pack(fill="x", padx=PAD, pady=(0, 8))
         ctk.CTkLabel(c, text="Palette", font=FONT, text_color=TEXT, height=20, anchor="w").pack(
             fill="x", padx=PAD, pady=(0, 2))
-        self.palette_grid = ChoiceGrid(c, render.PALETTE_NAMES, self.palette, self.set_palette, cols=3)
-        ctk.CTkFrame(c, fg_color="transparent", height=8).pack()
+        self.palette_grid = ChoiceGrid(c, self._palette_options(), self.palette, self.set_palette, cols=3)
+        pr = ctk.CTkFrame(c, fg_color="transparent")
+        pr.pack(fill="x", padx=PAD, pady=(4, 8))
+        button(pr, "New palette…", self.new_palette, width=10, height=28).pack(side="left", fill="x", expand=True)
+        self.btn_pal_edit = button(pr, "Edit…", self.edit_palette, width=10, height=28)
+        self.btn_pal_edit.pack(side="left", fill="x", expand=True, padx=(6, 0))
         self.colorbar = tk.Canvas(c, height=10, bg=SURFACE, highlightthickness=0)
         self.colorbar.pack(fill="x", padx=PAD)
         self.colorbar.bind("<Configure>", lambda e: self._draw_colorbar())
@@ -332,7 +371,7 @@ class App(ctk.CTk):
 
         self.tabs = segmented(main, MODES, self.set_mode)
         self.tabs.grid(row=0, column=0, sticky="w", pady=(4, 10))
-        ctk.CTkLabel(main, text="Space play · 1–3 views · B background · P palette · R reset view · C clear traces",
+        ctk.CTkLabel(main, text="Space play · 1–3 views · B background · P palette · F fit · R reset · C clear traces",
                      font=FONT_SMALL, text_color=MUTED).grid(row=0, column=0, sticky="e", pady=(4, 10))
 
         frame = ctk.CTkFrame(main, fg_color=SURFACE, corner_radius=12)
@@ -357,17 +396,19 @@ class App(ctk.CTk):
         button(bar, "↺  Reset time", self.reset_time, width=120).grid(row=0, column=3, rowspan=2, padx=(0, PAD))
 
     def _bind_stage(self):
+        """Mouse on the stage. Positions are taken relative to the image, right of the ruler."""
         s = self.stage
         s.bind("<Configure>", lambda e: self._view_changed())
         s.bind("<ButtonPress-1>", self._on_press)
         s.bind("<B1-Motion>", self._on_drag)
         s.bind("<ButtonRelease-1>", self._on_release)
+        s.bind("<Double-Button-1>", self._on_double)
         for b in ("2", "3"):   # right button: 2 on macOS, 3 on Windows and Linux
             s.bind(f"<ButtonPress-{b}>", lambda e: self.clear_pins())
-        s.bind("<Button-4>", lambda e: self._zoom_at(e.x, e.y, 1 / 1.15))   # wheel on Linux
-        s.bind("<Button-5>", lambda e: self._zoom_at(e.x, e.y, 1.15))
-        s.bind("<MouseWheel>", lambda e: self._zoom_at(e.x, e.y, 1 / 1.15 if e.delta > 0 else 1.15))
-        s.bind("<Motion>", lambda e: self._probe(e.x, e.y))
+        s.bind("<Button-4>", lambda e: self._zoom_at(e.x - GUTTER_L, e.y, 1 / 1.15))   # wheel on Linux
+        s.bind("<Button-5>", lambda e: self._zoom_at(e.x - GUTTER_L, e.y, 1.15))
+        s.bind("<MouseWheel>", lambda e: self._zoom_at(e.x - GUTTER_L, e.y, 1 / 1.15 if e.delta > 0 else 1.15))
+        s.bind("<Motion>", lambda e: self._probe(e.x - GUTTER_L, e.y))
         s.bind("<Leave>", lambda e: self._probe(None, None))
 
     @staticmethod
@@ -380,6 +421,15 @@ class App(ctk.CTk):
                 "<b>": self._cycle_background, "<p>": self._cycle_palette, "<t>": self.reset_time}
         for seq, fn in keys.items():
             self.bind(seq, self._unless_typing(fn))
+        nav = {"<Left>": (-0.1, 0), "<Right>": (0.1, 0), "<Up>": (0, 0.1), "<Down>": (0, -0.1)}
+        for seq, (fx, fy) in nav.items():
+            self.bind(seq, self._unless_typing(lambda fx=fx, fy=fy: self._pan_by(fx, fy)))
+            self.bind(seq.replace("<", "<Shift-"), self._unless_typing(lambda fx=fx, fy=fy: self._pan_by(5 * fx, 5 * fy)))
+        for seq in ("<plus>", "<equal>", "<KP_Add>"):
+            self.bind(seq, self._unless_typing(lambda: self._zoom_centre(1 / 1.25)))
+        for seq in ("<minus>", "<KP_Subtract>"):
+            self.bind(seq, self._unless_typing(lambda: self._zoom_centre(1.25)))
+        self.bind("<f>", self._unless_typing(self.fit_frame))
         self.bind("<Control-s>", lambda e: self.save_png())
         self.bind("<Control-e>", lambda e: self.export_video())
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -440,13 +490,34 @@ class App(ctk.CTk):
         self.set_background(keys[(keys.index(self.bg_kind) + 1) % len(keys)])
 
     def set_palette(self, key):
+        if key not in palettes.PALETTES:
+            key = "studio"
         self.palette = key
         self.palette_grid.select(key)
+        self.btn_pal_edit.configure(state="normal" if palettes.is_user(key) else "disabled")
         self._draw_colorbar()
         self._invalidate()                # trails keep only speeds: they take the new palette at once
 
+    @staticmethod
+    def _palette_options():
+        return [(k, _short(lbl, 12)) for k, lbl in palettes.PALETTE_NAMES]
+
+    def new_palette(self):
+        """Opens the palette editor on a copy of the current palette."""
+        PaletteEditor(self, self.palette, False, self._palette_saved)
+
+    def edit_palette(self):
+        if palettes.is_user(self.palette):
+            PaletteEditor(self, self.palette, True, self._palette_saved)
+
+    def _palette_saved(self, key, error):
+        self.palette_grid.set_options(self._palette_options(), key or self.palette)
+        self.set_palette(key or self.palette)
+        name = dict(palettes.PALETTE_NAMES).get(key, "")
+        self._status(error or (f"Saved the palette “{name}”." if key else "Palette deleted."))
+
     def _cycle_palette(self):
-        keys = [k for k, _ in render.PALETTE_NAMES]
+        keys = [k for k, _ in palettes.PALETTE_NAMES]
         self.set_palette(keys[(keys.index(self.palette) + 1) % len(keys)])
 
     def _draw_colorbar(self):
@@ -587,7 +658,8 @@ class App(ctk.CTk):
         return viewport.snap(fieldmod.View(self.center[0], self.center[1], self.half, w, h))
 
     def _stage_size(self):
-        return max(self.stage.winfo_width(), 50), max(self.stage.winfo_height(), 50)
+        """The image's size: the canvas less the rulers."""
+        return max(self.stage.winfo_width() - GUTTER_L, 50), max(self.stage.winfo_height() - GUTTER_B, 50)
 
     def _view_changed(self):
         """A pan, zoom or resize. The cached static layer is shown moved at once (a crop, or resampled after a
@@ -613,8 +685,60 @@ class App(ctk.CTk):
         self._sync_zoom()
         self._view_changed()
 
+    def _pan_by(self, fx, fy):
+        """Moves the view by fx of its width to the right and fy of its height up."""
+        view = self._view()
+        self.center = (self.center[0] + fx * view.w / view.scale, self.center[1] + fy * view.h / view.scale)
+        self._view_changed()
+
+    def _zoom_centre(self, factor):
+        view = self._view()
+        self._zoom_at(view.w / 2, view.h / 2, factor)
+
+    def fit_frame(self):
+        """Zooms out about the centre so that all the stage showed fits inside the export frame."""
+        view = self._view()
+        w, h = self._ex_dims()
+        _, _, fw, fh = export.frame_rect(view, w, h)
+        self.half = float(np.clip(self.half * max(view.w / fw, view.h / fh), HALF_MIN, HALF_MAX))
+        self._sync_zoom()
+        self._view_changed()
+        self._status("Zoomed out so that what the stage showed fits the export frame.")
+
+    def apply_view(self):
+        """Sets the centre and the half height typed in the VIEW card."""
+        try:
+            x, y, half = (float(self.ent_view[n].get()) for n in ("x", "y", "±"))
+        except ValueError:
+            self._status("The centre and the half height must be numbers.")
+            return
+        if not all(map(math.isfinite, (x, y, half))) or half <= 0:
+            self._status("The centre must be finite and the half height positive.")
+            return
+        self.center, self.half = (x, y), float(np.clip(half, HALF_MIN, HALF_MAX))
+        self._sync_zoom()
+        self._view_changed()
+        self.stage.focus_set()
+
+    def _ease_to(self, target):
+        """Glides the centre to `target` in EASE_S seconds (smoothstep)."""
+        if self._ease_id is not None:
+            self.after_cancel(self._ease_id)
+        start, t0 = self.center, time.perf_counter()
+
+        def step():
+            u = min(1.0, (time.perf_counter() - t0) / EASE_S)
+            s = u * u * (3 - 2 * u)
+            self.center = (start[0] + (target[0] - start[0]) * s, start[1] + (target[1] - start[1]) * s)
+            self._view_changed()
+            self._ease_id = self.after(16, step) if u < 1 else None
+        step()
+
     def _on_press(self, e):
         self.stage.focus_set()            # takes the focus away from the equation fields
+        if self._ease_id is not None:
+            self.after_cancel(self._ease_id)
+            self._ease_id = None
         self._press = (e.x, e.y, self.center)
         self._dragging = False
 
@@ -625,18 +749,27 @@ class App(ctk.CTk):
         if not self._dragging and abs(e.x - x0) + abs(e.y - y0) < 5:
             return
         self._dragging = True
-        s = self._view().scale
-        self.center = (c[0] - (e.x - x0) / s, c[1] + (e.y - y0) / s)
+        view = self._view()
+        cx, cy = c[0] - (e.x - x0) / view.scale, c[1] + (e.y - y0) / view.scale
+        if e.state & CONTROL:             # the centre jumps between grid lines
+            step = render.ticks(view)[0]
+            cx, cy = round(cx / step) * step, round(cy / step) * step
+        self.center = (cx, cy)
         self._view_changed()
 
     def _on_release(self, e):
-        if self._press is not None and not self._dragging:
-            x, y = self._view().to_world(e.x, e.y)
+        if self._press is not None and not self._dragging and e.state & SHIFT:
+            x, y = self._view().to_world(e.x - GUTTER_L, e.y)
             self.pins.append((float(x), float(y)))
             self._invalidate()
             self._status(f"Traced the streamline through ({_num(x)}, {_num(y)}). Right-click clears traces.")
         self._press = None
         self._dragging = False
+
+    def _on_double(self, e):
+        """Double-click: glide the clicked point to the centre."""
+        x, y = self._view().to_world(e.x - GUTTER_L, e.y)
+        self._ease_to((float(x), float(y)))
 
     def clear_pins(self):
         if self.pins:
@@ -645,6 +778,10 @@ class App(ctk.CTk):
             self._status("Traces cleared.")
 
     def _probe(self, px, py):
+        if px is not None:
+            w, h = self._stage_size()
+            if not (0 <= px < w and 0 <= py < h):
+                px = None                 # over the ruler
         if px is None or self.field is None:
             for lbl in self.probe.values():
                 lbl.configure(text="—")
@@ -810,48 +947,91 @@ class App(ctk.CTk):
         return render.screen(static, self.flow.image())
 
     def _show(self, view):
-        """Puts the frame on the stage. The Tk image and the caption are kept and refilled; the axis labels and
-        the export frame are drawn again only when the view or the export size changed."""
+        """Puts the frame on the stage, right of the ruler. The Tk image and the caption are kept and refilled;
+        the rulers, the export frame and the readouts are drawn again only when the view or they changed."""
         self._frame = self._compose(view)
-        img = Image.fromarray(np.ascontiguousarray(self._frame))
+        shown = self._frame
+        frame_rect = None
+        if self.show_frame.get():
+            frame_rect = export.frame_rect(view, *self._ex_dims())
+            shown = _dim_outside(shown, frame_rect)   # the display only: exports never see this
+        img = Image.fromarray(np.ascontiguousarray(shown))
         s = self.stage
         if self._photo is None or (self._photo.width(), self._photo.height()) != (view.w, view.h):
             self._photo = ImageTk.PhotoImage(img)
             if self._img_item is None:
-                self._img_item = s.create_image(0, 0, image=self._photo, anchor="nw")
-                self._cap_item = s.create_text(10, 6, anchor="nw", fill=MUTED, font=FONT_SECTION)
+                self._img_item = s.create_image(GUTTER_L, 0, image=self._photo, anchor="nw")
+                self._cap_item = s.create_text(GUTTER_L + 10, 6, anchor="nw", fill=MUTED, font=FONT_SECTION)
             else:
                 s.itemconfigure(self._img_item, image=self._photo)
         else:
             self._photo.paste(img)
-        hud = (view.ox, view.oy, view.scale, view.w, view.h, self.ex_size)
+        hud = (view.ox, view.oy, view.scale, view.w, view.h, self.ex_size, self.show_frame.get(),
+               self.show_scale.get())
         if hud != self._hud_key:
             self._hud_key = hud
             s.delete("hud")
-            w, h = self._ex_dims()
-            x, y, fw, fh = export.frame_rect(view, w, h)
-            s.create_rectangle(x, y, x + fw, y + fh, outline=MUTED, dash=(6, 4), tags="hud")
-            s.create_text(x + fw - 6, y + 6, anchor="ne", fill=MUTED, font=FONT_SMALL,
-                          text=f"{self.ex_size} · {w} × {h}", tags="hud")
-            self._draw_ticks(view)
+            self._draw_hud(view, frame_rect)
         s.itemconfigure(self._cap_item, text=self._caption())
         s.tag_raise(self._cap_item)
         self._last_show = time.perf_counter()
 
+    def _hud_changed(self):
+        self._hud_key = None
+        self._schedule_redraw()
+
+    def _draw_hud(self, view, frame_rect):
+        """Rulers in the gutters, the export frame, the centre cross with its readout and the scale bar."""
+        s, L = self.stage, GUTTER_L
+        self._draw_ticks(view)
+        if frame_rect is not None:
+            x, y, fw, fh = frame_rect
+            w, h = self._ex_dims()
+            s.create_rectangle(L + x, y, L + x + fw, y + fh, outline=MUTED, dash=(6, 4), tags="hud")
+            s.create_text(L + x + fw - 6, y + 6, anchor="ne", fill=MUTED, font=FONT_SMALL,
+                          text=f"{self.ex_size} · {w} × {h}", tags="hud")
+        cx, cy = L + view.w / 2, view.h / 2
+        for x0, y0, x1, y1 in ((cx - 9, cy, cx - 3, cy), (cx + 3, cy, cx + 9, cy),
+                               (cx, cy - 9, cx, cy - 3), (cx, cy + 3, cx, cy + 9)):
+            s.create_line(x0, y0, x1, y1, fill=MUTED, tags="hud")
+        # The centre as set (the view itself sits up to half a pixel off it, on the pixel lattice).
+        s.create_text(L + view.w - 8, view.h - 6, anchor="se", fill=MUTED, font=FONT_SMALL, tags="hud",
+                      text=f"centre ({_num(self.center[0])}, {_num(self.center[1])}) · ±{self.half:.3g}")
+        if self.show_scale.get():
+            length = render.nice_step(110 / view.scale)
+            px = length * view.scale
+            x0, y0 = L + 12, view.h - 12
+            s.create_line(x0, y0, x0 + px, y0, fill=TEXT, width=2, tags="hud")
+            for x in (x0, x0 + px):
+                s.create_line(x, y0 - 4, x, y0 + 4, fill=TEXT, width=2, tags="hud")
+            s.create_text(x0 + px / 2, y0 - 6, anchor="s", fill=TEXT, font=FONT_SMALL, text=f"{length:g}", tags="hud")
+        self._sync_view_entries(view)
+
+    def _sync_view_entries(self, view):
+        """Shows the view in the x / y / ± entries, unless one of them is being typed in."""
+        focus = self.focus_get()
+        if any(focus is e._entry for e in self.ent_view.values()):
+            return
+        for name, v in (("x", self.center[0]), ("y", self.center[1]), ("±", self.half)):
+            e = self.ent_view[name]
+            e.delete(0, "end")
+            e.insert(0, f"{v + 0.0:.6g}")
+
     def _draw_ticks(self, view):
-        """Coordinate labels along the bottom and left edges."""
+        """Rulers: the grid's coordinates in the gutters left of and under the image, with short ticks."""
+        s, L = self.stage, GUTTER_L
         step, xs, ys = render.ticks(view)
         dec = max(0, -math.floor(math.log10(step)))
         for x in xs:
-            px = view.to_px(x, 0)[0]
-            if 20 < px < view.w - 20:
-                self.stage.create_text(px, view.h - 4, anchor="s", fill=MUTED, font=FONT_SMALL, text=f"{x:.{dec}f}",
-                                       tags="hud")
+            px = L + view.to_px(x, 0)[0]
+            if L + 4 < px < L + view.w - 4:
+                s.create_line(px, view.h, px, view.h + 4, fill=MUTED, tags="hud")
+                s.create_text(px, view.h + 5, anchor="n", fill=MUTED, font=FONT_SMALL, text=f"{x:.{dec}f}", tags="hud")
         for y in ys:
             py = view.to_px(0, y)[1]
-            if 30 < py < view.h - 24:
-                self.stage.create_text(6, py, anchor="w", fill=MUTED, font=FONT_SMALL, text=f"{y:.{dec}f}",
-                                       tags="hud")
+            if 6 < py < view.h - 6:
+                s.create_line(L - 4, py, L, py, fill=MUTED, tags="hud")
+                s.create_text(L - 6, py, anchor="e", fill=MUTED, font=FONT_SMALL, text=f"{y:.{dec}f}", tags="hud")
 
     def _caption(self):
         f = self.field
