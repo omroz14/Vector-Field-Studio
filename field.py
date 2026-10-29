@@ -1,6 +1,7 @@
 """Vector fields: presets, safe expression parsing, the view transform, the sampled grid and streamlines."""
 import ast
 import math
+from fractions import Fraction
 
 import numpy as np
 
@@ -46,7 +47,8 @@ _NODES = (ast.Expression, ast.BinOp, ast.UnaryOp, ast.Compare, ast.Call, ast.Nam
 
 
 def _compile(expr, name):
-    """Compiles one component. Only the variables and FUNCTIONS may appear: no attributes, no indexing."""
+    """Compiles one component. Only the variables and FUNCTIONS may appear: no attributes, no indexing.
+    Returns (code, syntax tree)."""
     src = expr.strip().replace("^", "**")
     if not src:
         raise ValueError(f"{name} is empty.")
@@ -62,7 +64,76 @@ def _compile(expr, name):
             raise ValueError(f"{name}: unknown name “{node.id}”.")
         if isinstance(node, ast.Call) and (node.keywords or not isinstance(node.func, ast.Name)):
             raise ValueError(f"{name}: only plain calls like sin(x) are supported.")
-    return compile(tree, name, "eval")
+    return compile(tree, name, "eval"), tree
+
+
+def _names(node):
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+
+def _constant(node):
+    """The value of a subtree made of numbers, pi, e and functions only (no variables), else None."""
+    if not _names(node) <= set(FUNCTIONS):
+        return None
+    try:
+        v = float(eval(compile(ast.Expression(node), "c", "eval"), _GLOBALS))
+    except Exception:
+        return None
+    return v if math.isfinite(v) else None
+
+
+def _omega(node):
+    """ω if the subtree is ω·t + c(x, y) with a constant ω (0 when it does not involve t), else None."""
+    if "t" not in _names(node):
+        return 0.0
+    if isinstance(node, ast.Name):
+        return 1.0
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        w = _omega(node.operand)
+        return None if w is None else (-w if isinstance(node.op, ast.USub) else w)
+    if isinstance(node, ast.BinOp):
+        a, b = _omega(node.left), _omega(node.right)
+        if a is None or b is None:
+            return None
+        if isinstance(node.op, (ast.Add, ast.Sub)):
+            return a + b if isinstance(node.op, ast.Add) else a - b
+        if isinstance(node.op, ast.Mult):
+            if a == 0 and (k := _constant(node.left)) is not None:
+                return k * b
+            if b == 0 and (k := _constant(node.right)) is not None:
+                return a * k
+        if isinstance(node.op, ast.Div) and b == 0 and (k := _constant(node.right)):
+            return a / k
+    return None
+
+
+def _period(trees):
+    """The period in t of a field whose expressions use t only as sin or cos(ω·t + c), the common period
+    when the ω are rational multiples of each other; None if there is none (or t is not used)."""
+    omegas = []
+
+    def visit(node):
+        if (isinstance(node, ast.Call) and node.func.id in ("sin", "cos") and len(node.args) == 1
+                and (w := _omega(node.args[0])) is not None):
+            if w:
+                omegas.append(abs(w))
+            return True
+        if isinstance(node, ast.Name) and node.id == "t":
+            return False
+        return all(visit(c) for c in ast.iter_child_nodes(node))
+
+    if not all(visit(t) for t in trees) or not omegas:
+        return None
+    base = omegas[0]
+    ratios = []
+    for w in omegas:
+        r = Fraction(w / base).limit_denominator(64)
+        if abs(float(r) - w / base) > 1e-9 * (w / base):
+            return None   # incommensurate frequencies: never repeats exactly
+        ratios.append(r)
+    num = math.gcd(*(r.numerator for r in ratios))
+    den = math.lcm(*(r.denominator for r in ratios))
+    return 2 * math.pi / (base * num / den)
 
 
 _GLOBALS = {"__builtins__": {}, **FUNCTIONS}
@@ -73,9 +144,11 @@ class Field:
 
     def __init__(self, fx, fy):
         self.fx, self.fy = fx.strip(), fy.strip()
-        self._code = (_compile(fx, "Fx"), _compile(fy, "Fy"))
+        (cx, tx), (cy, ty) = _compile(fx, "Fx"), _compile(fy, "Fy")
+        self._code = (cx, cy)
         names = set().union(*(c.co_names for c in self._code))
         self.uses_t = "t" in names
+        self.period = _period((tx, ty)) if self.uses_t else None   # in t, for seamless loops
         self._uses_r, self._uses_theta = "r" in names, "theta" in names
         self(np.linspace(-1, 1, 5), np.linspace(-1, 1, 5))   # surfaces runtime errors now
 

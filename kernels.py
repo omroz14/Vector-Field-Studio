@@ -340,7 +340,7 @@ def splat_paths(D, S, x0, y0, x1, y1, w, speed, nsub, rho):
 
 @nb.njit(cache=True, nogil=True, parallel=True)
 def tonemap(D, S, kappa, inv_vref, lut, delta, out):
-    """Trail colours into out (uint8 h × w × 3): brightness 1 − exp(−κD), colour lut[S / (D·vref)], so dense
+    """Trail colours into out (uint8 h × w × 3): brightness 1 − exp(−κD), colour lut(S / (D·vref)), so dense
     trails saturate softly and every pixel shows the mean speed of what passed it. Then fades D and S by delta
     for the next frame (tiny values go to zero, so they never turn into slow denormals)."""
     h, w = D.shape
@@ -349,9 +349,11 @@ def tonemap(D, S, kappa, inv_vref, lut, delta, out):
             d = D[j, i]
             if d > 1e-4:
                 b = 1.0 - math.exp(-kappa * d)
-                q = int(min(max(S[j, i] / d * inv_vref, 0.0), 1.0) * 255.0)
+                q = min(max(S[j, i] / d * inv_vref, 0.0), 1.0) * 255.0
+                q0 = min(int(q), 254)   # between two LUT entries: the colour changes smoothly with speed
+                f = q - q0
                 for c in range(3):
-                    out[j, i, c] = np.uint8(b * lut[q, c] + 0.5)
+                    out[j, i, c] = np.uint8(b * ((1.0 - f) * lut[q0, c] + f * lut[q0 + 1, c]) + 0.5)
                 D[j, i] = d * delta
                 S[j, i] *= delta
             else:

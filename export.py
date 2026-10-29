@@ -24,6 +24,7 @@ SIZES = (("4:5", 1080, 1350), ("9:16", 1080, 1920), ("1:1", 1080, 1080), ("16:9"
 FORMATS = (("mp4", "MP4"), ("gif", "GIF"), ("prores", "ProRes"), ("png", "PNGs"))
 EXTENSIONS = {"mp4": ".mp4", "gif": ".gif", "prores": ".mov", "png": ".png", "still": ".png"}
 FRAME_MARGIN = 16     # px between the export frame and the edges of the stage
+CROSSFADE = 18        # frames blended across the seam of a loop that cannot repeat exactly
 GIF_WIDTH = 540       # a GIF is a preview: at most this wide
 
 
@@ -58,6 +59,8 @@ class Settings:
     format: str = "mp4"     # mp4, gif, prores, png (a sequence) or still (one PNG)
     ss: int = 2             # supersampling of the static layer
     grid: bool = False      # draw the grid and axes into the export
+    loop: bool = True       # a seamless loop: the frame after the last one is the first one
+    period: float = None    # period in t of a time-dependent field (None: not periodic, crossfade the seam)
 
     @property
     def frames(self):
@@ -75,13 +78,36 @@ class Renderer:
         self.style = replace(scene.style, px_per_pt=settings.height / fh)
         # The colour scale and the particle pace of the preview, held for the whole export.
         self.vref = scene.vref or fieldmod.reference_speed(scene.field, stage, scene.t)
+        self._steady = None   # (image, grid) of a steady field, built once
+
+        # How the clip loops: "exact" repeats every `frames` frames (steady fields, and periodic ones with
+        # whole periods per loop), "crossfade" blends the end into the start, "plain" does not loop.
+        n, fps, uses_t = settings.frames, settings.fps, scene.field.uses_t
+        self.kind = "plain"
+        if settings.loop and settings.format != "still":
+            self.kind = "exact" if not uses_t or settings.period else "crossfade"
+        self.dt = particles.frame_dt(scene.field, self.view, self.style, self.vref, fps, scene.t_rate)
+        self.periods = 0
+        if self.kind == "exact" and uses_t:
+            # The nearest whole number of periods to what the time rate would cover in the clip.
+            self.periods = max(1, round(scene.t_rate * n / fps / settings.period))
+            self.dt = self.periods * settings.period / n
+
         self.flow = None
         if scene.density > 0:
-            self.flow = particles.Flow(scene.density, self.view, settings.fps, self.style.px_per_pt, seed)
-        self._steady = None   # (image, grid) of a steady field, built once
-        self.warm_up = 0      # frames the particles run before the first recorded one, so trails are grown
+            k = self.style.px_per_pt
+            if self.kind == "exact":
+                self.flow = particles.LoopFlow(scene.density, self.view, fps, n, k, seed)
+            else:
+                self.flow = particles.Flow(scene.density, self.view, fps, k, seed)
+        # Steps before the first frame comes out: particles growing their trails, and for a crossfade the
+        # frames held back for the seam.
+        self.fade = min(CROSSFADE, n // 2) if self.kind == "crossfade" else 0
+        self._grow = 0
         if self.flow is not None:
-            self.warm_up = math.ceil(settings.fps * max(particles.LIFE[1], 5 * self.style.trail))
+            self._grow = (self.flow.warm_up(self.style) if self.kind == "exact"
+                          else math.ceil(fps * max(particles.LIFE[1], 5 * self.style.trail)))
+        self.warm_up = self._grow + self.fade
 
     def _static(self, t, record):
         """(art image or None, grid) at time t. A steady field's layer is built once."""
@@ -97,19 +123,49 @@ class Renderer:
             self._steady = (img, grid)
         return img, grid
 
-    def frames(self):
-        """Yields one item per step: None while the particles warm up, then settings.frames frames
-        (uint8, height × width × 3). The recording starts at the scene's t."""
-        sc = self.scene
-        dt = particles.frame_dt(sc.field, self.view, self.style, self.vref, self.settings.fps, sc.t_rate)
-        t = sc.t - self.warm_up * dt
-        for i in range(self.warm_up + self.settings.frames):
-            record = i >= self.warm_up
-            img, grid = self._static(t, record)
-            if self.flow is not None:
-                self.flow.step(grid, dt, self.vref, self.style)
-            yield (render.screen(img, self.flow.image()) if self.flow is not None else img) if record else None
-            t += dt
+    def _frame(self, f, record):
+        """Advances to frame f (negative while warming up) and returns its image if `record`."""
+        n = self.settings.frames
+        # An exact loop takes t from f mod n, so the field repeats bit for bit; otherwise t runs on.
+        t = self.scene.t + ((f % n) if self.kind == "exact" else f) * self.dt
+        img, grid = self._static(t, record)
+        if self.flow is not None:
+            if self.kind == "exact":
+                self.flow.step(grid, self.dt, self.vref, self.style, f)
+            else:
+                self.flow.step(grid, self.dt, self.vref, self.style)
+        if not record:
+            return None
+        return render.screen(img, self.flow.image()) if self.flow is not None else img
+
+    def frames(self, extra=0):
+        """Yields one item per step: None while warming up (self.warm_up of them), then settings.frames
+        frames (uint8, height × width × 3) starting at the scene's t. `extra` more frames continue an exact
+        loop past its end (frame n + i should equal frame i: a test of the loop)."""
+        n = self.settings.frames
+        for f in range(-self._grow, 0):
+            yield self._frame(f, False)
+        if self.kind != "crossfade":
+            for f in range(n + (extra if self.kind == "exact" else 0)):
+                yield self._frame(f, True)
+            return
+        # Crossfade: render n + M frames F; the loop is F_M … F_(n−1), then G_j = (1 − w_j)·F_(n+j) + w_j·F_j
+        # for j < M with w_j rising smoothly from 0 to 1. Its last frame leads into F_M and F_(n−1) into its
+        # first blended one, so both joins are continuous. Starting at F_M lets frames stream out at once.
+        M = self.fade
+        held = []
+        for f in range(n + M):
+            img = self._frame(f, True)
+            if f < M:
+                held.append(img)
+                yield None
+            elif f < n:
+                yield img
+            else:
+                j = f - n
+                u = (j + 0.5) / M
+                w = u * u * (3 - 2 * u)
+                yield ((1 - w) * img + w * held[j] + 0.5).astype(np.uint8)
 
 
 # ---------- writers ----------
@@ -127,8 +183,11 @@ def ffmpeg_args(settings, path):
     tags = ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
     fmt = settings.format
     if fmt == "mp4":
+        # In a loop the last frames are seen as often as the first: mbtree would spend less on them
+        # (nothing refers to them), which shows as a jump in quality at the seam.
+        loop = ["-x264-params", "mbtree=0"] if settings.loop else []
         cmd += ["-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv420p", "-c:v", "libx264",
-                "-preset", "slow", "-crf", "16", "-profile:v", "high", *tags, "-movflags", "+faststart", path]
+                "-preset", "slow", "-crf", "16", "-profile:v", "high", *loop, *tags, "-movflags", "+faststart", path]
     elif fmt == "prores":
         cmd += ["-vf", "scale=out_color_matrix=bt709:out_range=tv,format=yuv444p10le", "-c:v", "prores_ks",
                 "-profile:v", "4", "-vendor", "apl0", *tags, path]

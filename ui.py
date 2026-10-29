@@ -123,6 +123,7 @@ class App(ctk.CTk):
         self.ex_seconds = 10
         self.ex_ss = 2                  # supersampling of the static layer
         self.ex_grid = tk.BooleanVar(value=False)
+        self.ex_loop = True             # a seamless loop
         self._export = None             # the running export.Export
         self._worker = worker.Worker()  # builds static layers off the Tk thread
         self._gen = 0                   # number of the newest static layer asked for
@@ -290,6 +291,16 @@ class App(ctk.CTk):
         self.ex_ss_tabs.pack(side="left", padx=(6, 0))
         self.row_seconds = SliderRow(c, "Duration", 1, 30, self.ex_seconds, self._on_ex_seconds,
                                      fmt=lambda v: f"{v} s")
+        self.ex_loop_tabs = segmented(c, ("Seamless loop", "No loop"), self._on_ex_loop)
+        self.ex_loop_tabs.set("Seamless loop")
+        self.ex_loop_tabs.pack(fill="x", padx=PAD, pady=(8, 6))
+        row = ctk.CTkFrame(c, fg_color="transparent")
+        row.pack(fill="x", padx=PAD)
+        ctk.CTkLabel(row, text="Period of t", font=FONT, text_color=TEXT, height=20).pack(side="left")
+        self.ent_period = entry(row, width=96)
+        self.ent_period.pack(side="right")
+        self.ent_period.bind("<KeyRelease>", lambda e: self._ex_note())
+        self.ent_period.bind("<Escape>", lambda e: self.stage.focus_set())
         switch(c, "Include grid and axes", self.ex_grid, lambda: None).pack(anchor="w", padx=PAD, pady=(8, 0))
         self.lbl_ex = note(c, "", pady=(6, 8))
         ex = ctk.CTkFrame(c, fg_color="transparent")
@@ -390,6 +401,12 @@ class App(ctk.CTk):
         self.preset_grid.select(self.preset)
         self.flow = None
         self.row_rate.enable(f.uses_t)
+        self.ent_period.configure(state="normal")
+        self.ent_period.delete(0, "end")
+        if f.period:
+            self.ent_period.insert(0, f"{f.period:.6g}")
+        self.ent_period.configure(state="normal" if f.uses_t else "disabled")
+        self._ex_note()
         self.row_speed.enable(not f.uses_t)
         self._invalidate()
         self._status("Field applied." + (" It uses t: Space runs time." if f.uses_t else ""))
@@ -486,7 +503,25 @@ class App(ctk.CTk):
     def _ex_dims(self):
         return next((w, h) for k, w, h in export.SIZES if k == self.ex_size)
 
+    def _on_ex_loop(self, label):
+        self.ex_loop = label == "Seamless loop"
+        self._ex_note()
+
+    def _period(self):
+        """The period of t typed in the export card (detected when the field was applied), or None."""
+        text = self.ent_period.get().strip()
+        f = self.field
+        if f is not None and f.period and text == f"{f.period:.6g}":
+            return f.period   # unchanged: the exact value, not its 6 shown digits
+        try:
+            p = float(text)
+        except ValueError:
+            return None
+        return p if p > 0 and math.isfinite(p) else None
+
     def _ex_note(self):
+        if not hasattr(self, "lbl_ex"):
+            return   # still building the panels
         w, h = self._ex_dims()
         text = f"{w} × {h} px, {self.ex_fps} fps, {self.ex_seconds} s: the dashed frame on the stage."
         if self.ex_format == "gif":
@@ -494,6 +529,15 @@ class App(ctk.CTk):
                     f"(GIF counts time in 1/100 s), {self.ex_seconds} s.")
         elif self.ex_format == "png":
             text += " One PNG per frame, numbered."
+        if self.ex_loop and self.field is not None:
+            if not self.field.uses_t:
+                text += " The particles follow a schedule that repeats exactly."
+            elif (p := self._period()) is not None:
+                n = max(1, round(self.t_rate * self.ex_seconds / p))
+                text += f" t runs {n} whole period{'s' if n > 1 else ''} of {p:.4g}, so the loop is exact."
+            else:
+                text += (" t is not periodic here: the last frames blend into the first. Type a period of t "
+                         "to make the loop exact.")
         self.lbl_ex.configure(text=text)
 
     def _on_speed(self, v):
@@ -504,6 +548,7 @@ class App(ctk.CTk):
 
     def _on_rate(self, v):
         self.t_rate = _rate_from(v)
+        self._ex_note()
 
     def _style(self, px_per_pt=1.0):
         """The current look as a render.Style, for a render at px_per_pt pixels per stage pixel."""
@@ -827,7 +872,8 @@ class App(ctk.CTk):
 
     def _ex_settings(self, fmt):
         w, h = self._ex_dims()
-        return export.Settings(w, h, self.ex_fps, self.ex_seconds, fmt, self.ex_ss, self.ex_grid.get())
+        return export.Settings(w, h, self.ex_fps, self.ex_seconds, fmt, self.ex_ss, self.ex_grid.get(),
+                               self.ex_loop, self._period())
 
     def save_png(self):
         """A still of the export frame at the export size."""
